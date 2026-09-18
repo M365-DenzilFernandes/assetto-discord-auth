@@ -43,7 +43,7 @@ app.get("/callback", async (req, res) => {
 
     authenticatedUsers[ac_guid] = userRes.data.id;
 
-    res.send("Authentication complete. You can close this window.");
+    res.send("✅ MyDragyPro Authentication Complete. You can close this window. ❌");
 });
 
 app.get("/check", (req, res) => {
