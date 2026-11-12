@@ -64,7 +64,11 @@ app.get("/callback", async (req, res) => {
     );
 
     authenticatedUsers[ac_guid] = userRes.data.id;
-
+    console.log(
+        `[AUTH] OAuth link stored: ` +
+        `ac_guid=${JSON.stringify(ac_guid)} ` +
+        `discord_id=${userRes.data.id}`
+    );
     res.send(
         "✅ MyDragyPro Authentication Complete. " +
         "You can close this window. ❌"
@@ -149,7 +153,15 @@ app.post("/sponsor-request", async (req, res) => {
             acGuid && authenticatedUsers[acGuid]
                 ? authenticatedUsers[acGuid]
                 : null;
-
+        
+        console.log(
+            `[SPONSOR] Request identity: ` +
+            `ac_guid=${JSON.stringify(acGuid)} ` +
+            `linked=${Boolean(discordId)} ` +
+            `discord_id=${discordId || "none"} ` +
+            `stored_links=${Object.keys(authenticatedUsers).length}`
+        );
+        
         const requesterText = discordId
             ? `Linked Discord user: <@${discordId}>`
             : "Not linked to Discord";
