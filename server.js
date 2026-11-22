@@ -244,6 +244,167 @@ app.get("/login", (req, res) => {
     return res.redirect(url);
 });
 
+function renderAuthPage({ success, title, message }) {
+ const accent = success ? "#55d68b" : "#ff5c70";
+ const icon = success ? "✓" : "!";
+ const status = success ? "Discord Connected" : "Connection Failed";
+
+ return `<!DOCTYPE html>
+<html lang="en">
+<head>
+ <meta charset="UTF-8">
+ <meta name="viewport" content="width=device-width, initial-scale=1">
+ <meta name="theme-color" content="#090b12">
+ <title>${title}</title>
+ <style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; min-height: 100%; }
+  body {
+   min-height: 100vh;
+   display: flex;
+   align-items: center;
+   justify-content: center;
+   padding: 24px;
+   color: #f4f6ff;
+   background:
+    radial-gradient(circle at 20% 10%, rgba(88,101,242,.22), transparent 35%),
+    radial-gradient(circle at 80% 90%, rgba(39,201,123,.13), transparent 35%),
+    linear-gradient(145deg, #080a10, #111521);
+   font-family: Inter, "Segoe UI", Arial, sans-serif;
+  }
+  .card {
+   width: min(440px, 100%);
+   padding: 38px 32px 30px;
+   text-align: center;
+   background: rgba(18,22,34,.92);
+   border: 1px solid rgba(255,255,255,.09);
+   border-radius: 24px;
+   box-shadow: 0 24px 70px rgba(0,0,0,.55);
+   backdrop-filter: blur(16px);
+  }
+  .brand {
+   display: flex;
+   align-items: center;
+   justify-content: center;
+   gap: 11px;
+   margin-bottom: 28px;
+  }
+  .brand-mark {
+   width: 42px;
+   height: 42px;
+   display: grid;
+   place-items: center;
+   color: #fff;
+   font-size: 15px;
+   font-weight: 900;
+   letter-spacing: -.5px;
+   border-radius: 12px;
+   background: linear-gradient(135deg, #5865f2, #7447ff);
+   box-shadow: 0 8px 28px rgba(88,101,242,.38);
+  }
+  .brand-name {
+   font-size: 21px;
+   font-weight: 800;
+   letter-spacing: -.4px;
+  }
+  .brand-name span { color: #8a93ff; }
+  .status-icon {
+   width: 72px;
+   height: 72px;
+   display: grid;
+   place-items: center;
+   margin: 0 auto 22px;
+   color: ${accent};
+   font-size: 37px;
+   font-weight: 800;
+   border: 2px solid ${accent};
+   border-radius: 50%;
+   background: ${success ? "rgba(85,214,139,.10)" : "rgba(255,92,112,.10)"};
+   box-shadow: 0 0 35px ${success ? "rgba(85,214,139,.16)" : "rgba(255,92,112,.16)"};
+  }
+  .eyebrow {
+   margin-bottom: 8px;
+   color: ${accent};
+   font-size: 12px;
+   font-weight: 800;
+   letter-spacing: 1.6px;
+   text-transform: uppercase;
+  }
+  h1 {
+   margin: 0 0 12px;
+   font-size: 28px;
+   line-height: 1.15;
+  }
+  .message {
+   margin: 0 auto;
+   max-width: 340px;
+   color: #aeb5c8;
+   font-size: 15px;
+   line-height: 1.65;
+  }
+  button {
+   width: 100%;
+   margin-top: 28px;
+   padding: 14px 20px;
+   color: #fff;
+   font: inherit;
+   font-weight: 750;
+   cursor: pointer;
+   border: 0;
+   border-radius: 12px;
+   background: linear-gradient(135deg, #5865f2, #7549f5);
+   box-shadow: 0 10px 28px rgba(88,101,242,.28);
+   transition: transform .15s ease, filter .15s ease;
+  }
+  button:hover { transform: translateY(-1px); filter: brightness(1.08); }
+  button:active { transform: translateY(0); }
+  .close-note {
+   min-height: 18px;
+   margin-top: 12px;
+   color: #777f93;
+   font-size: 12px;
+  }
+  .footer {
+   margin-top: 24px;
+   padding-top: 20px;
+   color: #666e82;
+   font-size: 11px;
+   border-top: 1px solid rgba(255,255,255,.07);
+  }
+ </style>
+</head>
+<body>
+ <main class="card">
+  <div class="brand">
+   <div class="brand-mark">MDP</div>
+   <div class="brand-name">MyDragy<span>Pro</span></div>
+  </div>
+
+  <div class="status-icon">${icon}</div>
+  <div class="eyebrow">${status}</div>
+  <h1>${title}</h1>
+  <p class="message">${message}</p>
+
+  <button type="button" onclick="closeAuthWindow()">Close Window</button>
+  <div class="close-note" id="closeNote">You can safely return to MyDragyPro.</div>
+
+  <div class="footer">Secure authentication powered by Discord</div>
+ </main>
+
+ <script>
+  function closeAuthWindow() {
+   window.close();
+
+   setTimeout(function () {
+    document.getElementById("closeNote").textContent =
+     "Your browser prevented automatic closing. You can close this tab manually.";
+   }, 300);
+  }
+ </script>
+</body>
+</html>`;
+}
+
 app.get("/callback", async (req, res) => {
     try {
         const code = cleanText(
@@ -304,10 +465,14 @@ app.get("/callback", async (req, res) => {
             `discord_id=${discordId}`
         );
 
-        return res.send(
-            "✅ MyDragyPro Authentication Complete. " +
-            "You can close this window. ❌"
-        );
+        return res
+        .status(200)
+        .type("html")
+        .send(renderAuthPage({
+        success: true,
+        title: "Authentication Complete",
+        message: "Your Discord account has been securely connected to MyDragyPro. You can now close this window and return to the app."
+        }));
     } catch (error) {
         const status =
             error.response?.status;
@@ -321,10 +486,14 @@ app.get("/callback", async (req, res) => {
             details || ""
         );
 
-        return res.status(502).send(
-            "❌ MyDragyPro Authentication Failed. " +
-            "Please close this window and try again."
-        );
+        return res
+        .status(502)
+        .type("html")
+        .send(renderAuthPage({
+        success: false,
+        title: "Authentication Failed",
+        message: "We could not connect your Discord account. Close this window, return to MyDragyPro, and try the authentication process again."
+        }));
     }
 });
 
