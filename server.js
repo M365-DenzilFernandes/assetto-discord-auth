@@ -1,5 +1,6 @@
 import express from "express";
 import axios from "axios";
+import crypto from "node:crypto";
 
 const app = express();
 
@@ -44,6 +45,20 @@ const PRESENCE_TTL_SECONDS = 90;
 const PRESENCE_HEARTBEAT_SECONDS = 45;
 const PRESENCE_STALE_SECONDS = 90;
 const MAX_VISIBLE_PLAYERS = 100;
+
+// Beat My Time challenge records are short-lived coordination messages. Run
+// timing remains entirely client-side; only completed, validated result data is
+// submitted here.
+const CHALLENGE_KEY_PREFIX =
+    "mydragypro:challenge:";
+const CHALLENGE_INBOX_PREFIX =
+    "mydragypro:challenge-inbox:";
+const CHALLENGE_OUTBOX_PREFIX =
+    "mydragypro:challenge-outbox:";
+const CHALLENGE_PAIR_PREFIX =
+    "mydragypro:challenge-pair:";
+const CHALLENGE_TTL_SECONDS = 2 * 60 * 60;
+const MAX_CHALLENGES_PER_LIST = 100;
 
 // =========================================================
 // General helpers
@@ -164,6 +179,117 @@ function cleanAvailability(value) {
     return ["available", "busy", "dnd"].includes(availability)
         ? availability
         : "available";
+}
+
+function cleanChallengeAccess(value) {
+    const access = cleanText(value, 20).toLowerCase();
+
+    return ["friends", "everyone", "off"].includes(access)
+        ? access
+        : "friends";
+}
+
+function cleanModeKey(value) {
+    const modeKey = cleanText(value, 100).toLowerCase();
+    return /^[a-z0-9:_-]{1,100}$/.test(modeKey)
+        ? modeKey
+        : "";
+}
+
+function parseStoredJson(value, label = "record") {
+    if (value === null || value === undefined || value === "") {
+        return null;
+    }
+
+    try {
+        return typeof value === "string"
+            ? JSON.parse(value)
+            : value;
+    } catch {
+        throw new Error(`Stored ${label} is invalid JSON.`);
+    }
+}
+
+function challengeKey(challengeId) {
+    return `${CHALLENGE_KEY_PREFIX}${cleanText(challengeId, 64)}`;
+}
+
+function challengeInboxKey(acGuid) {
+    return `${CHALLENGE_INBOX_PREFIX}${normalizeAcGuid(acGuid)}`;
+}
+
+function challengeOutboxKey(acGuid) {
+    return `${CHALLENGE_OUTBOX_PREFIX}${normalizeAcGuid(acGuid)}`;
+}
+
+function challengePairKey(firstPlayer, secondPlayer) {
+    const pair = [
+        normalizeAcGuid(firstPlayer),
+        normalizeAcGuid(secondPlayer)
+    ].sort().join("\u0000");
+
+    const digest = crypto
+        .createHash("sha256")
+        .update(pair)
+        .digest("hex");
+
+    return `${CHALLENGE_PAIR_PREFIX}${digest}`;
+}
+
+function challengeTtlRemaining(challenge, now = nowUnixSeconds()) {
+    return Math.max(1, Number(challenge?.expires_at || 0) - now);
+}
+
+async function getPresenceRecord(acGuid) {
+    const stored = await upstashCommand(
+        "GET",
+        presenceKeyForAcGuid(acGuid)
+    );
+    return parseStoredJson(stored, "presence record");
+}
+
+async function getChallengeRecord(challengeId) {
+    const id = cleanText(challengeId, 64);
+    if (!/^[a-f0-9]{32}$/.test(id)) return null;
+
+    const stored = await upstashCommand("GET", challengeKey(id));
+    return parseStoredJson(stored, "challenge record");
+}
+
+function challengeIsActive(challenge, now = nowUnixSeconds()) {
+    return challenge
+        && Number(challenge.expires_at || 0) > now
+        && ["pending", "accepted"].includes(challenge.status);
+}
+
+function publicChallenge(challenge) {
+    if (!challenge || typeof challenge !== "object") return null;
+
+    return {
+        id: cleanText(challenge.id, 64),
+        type: "beat_my_time",
+        from_player_id: cleanText(challenge.from_player_id, 100),
+        from_driver_name: cleanText(challenge.from_driver_name, 100),
+        to_player_id: cleanText(challenge.to_player_id, 100),
+        to_driver_name: cleanText(challenge.to_driver_name, 100),
+        mode_key: cleanModeKey(challenge.mode_key),
+        mode_label: cleanText(challenge.mode_label, 120),
+        target_ms: Number(challenge.target_ms) || 0,
+        source_run_ref: cleanText(challenge.source_run_ref, 100),
+        source_run_timestamp: Number(challenge.source_run_timestamp) || 0,
+        status: cleanText(challenge.status, 20),
+        created_at: Number(challenge.created_at) || 0,
+        accepted_at: Number(challenge.accepted_at) || 0,
+        expires_at: Number(challenge.expires_at) || 0,
+        attempts: Number(challenge.attempts) || 0,
+        best_ms: Number(challenge.best_ms) || 0,
+        last_attempt_ms: Number(challenge.last_attempt_ms) || 0,
+        last_attempt_at: Number(challenge.last_attempt_at) || 0,
+        beaten: challenge.beaten === true,
+        completed_at: Number(challenge.completed_at) || 0,
+        terminal_at: Number(challenge.terminal_at) || 0,
+        version: 1
+    };
 }
 
 function noStore(res) {
@@ -698,6 +824,7 @@ app.post(
                 track_hash,
                 mode,
                 availability,
+                challenge_access,
                 app_version
             } = req.body || {};
 
@@ -717,6 +844,8 @@ app.post(
                 mode: cleanText(mode, 40),
                 availability:
                     cleanAvailability(availability),
+                challenge_access:
+                    cleanChallengeAccess(challenge_access),
                 app_version: cleanText(app_version, 30),
                 updated_at: updatedAt,
                 version: 1
@@ -770,6 +899,10 @@ app.get(
         try {
             const requesterGuid =
                 req.mdpIdentity.acGuid;
+            const requesterPresence =
+                await getPresenceRecord(requesterGuid);
+            const requesterServerHash =
+                cleanHash(requesterPresence?.server_hash);
             const now = nowUnixSeconds();
             const cutoff =
                 now - PRESENCE_STALE_SECONDS;
@@ -854,6 +987,20 @@ app.get(
                             cleanAvailability(
                                 record?.availability
                             ),
+                        challenge_access:
+                            cleanChallengeAccess(
+                                record?.challenge_access
+                            ),
+                        can_challenge:
+                            cleanChallengeAccess(record?.challenge_access) !== "off"
+                            && cleanAvailability(record?.availability) !== "dnd"
+                            && (
+                                cleanChallengeAccess(record?.challenge_access) === "everyone"
+                                || (
+                                    cleanHash(record?.server_hash) !== ""
+                                    && cleanHash(record?.server_hash) === requesterServerHash
+                                )
+                            ),
                         app_version:
                             cleanText(record?.app_version, 30),
                         updated_at: updatedAt,
@@ -926,6 +1073,434 @@ app.post(
     }
 );
 
+// =========================================================
+// Beat My Time challenges (phase two)
+// =========================================================
+
+app.post(
+    "/challenges",
+    requireLinkedIdentity,
+    async (req, res) => {
+        noStore(res);
+
+        try {
+            const fromPlayerId = req.mdpIdentity.acGuid;
+            const toPlayerId = normalizeAcGuid(
+                req.body?.target_player_id
+            );
+            const type = cleanText(req.body?.type, 40).toLowerCase();
+            const modeKey = cleanModeKey(req.body?.mode_key);
+            const modeLabel = cleanText(req.body?.mode_label, 120);
+            const targetMs = Math.round(Number(req.body?.target_ms));
+            const sourceRunRef = cleanText(req.body?.source_run_ref, 100);
+            const sourceRunTimestamp = Math.floor(
+                Number(req.body?.source_run_timestamp) || 0
+            );
+
+            if (!toPlayerId || toPlayerId === fromPlayerId) {
+                return res.status(400).json({
+                    success: false,
+                    error: "Select another online player."
+                });
+            }
+            if (type !== "beat_my_time") {
+                return res.status(400).json({
+                    success: false,
+                    error: "Unsupported challenge type."
+                });
+            }
+            if (!modeKey || !modeLabel) {
+                return res.status(400).json({
+                    success: false,
+                    error: "A valid challenge mode is required."
+                });
+            }
+            if (!Number.isFinite(targetMs) || targetMs < 100 || targetMs > 3600000) {
+                return res.status(400).json({
+                    success: false,
+                    error: "Target time is outside the supported range."
+                });
+            }
+
+            const now = nowUnixSeconds();
+            const [fromPresence, toPresence] = await Promise.all([
+                getPresenceRecord(fromPlayerId),
+                getPresenceRecord(toPlayerId)
+            ]);
+
+            if (!toPresence
+                || now - Number(toPresence.updated_at || 0) > PRESENCE_STALE_SECONDS) {
+                return res.status(404).json({
+                    success: false,
+                    error: "That player is no longer online."
+                });
+            }
+
+            const targetAccess = cleanChallengeAccess(
+                toPresence.challenge_access
+            );
+            const targetAvailability = cleanAvailability(
+                toPresence.availability
+            );
+            const sameServer = cleanHash(fromPresence?.server_hash) !== ""
+                && cleanHash(fromPresence?.server_hash) === cleanHash(toPresence.server_hash);
+
+            if (targetAvailability === "dnd" || targetAccess === "off") {
+                return res.status(403).json({
+                    success: false,
+                    error: "That player is not accepting challenges."
+                });
+            }
+            // Phase-two "Friends" is intentionally conservative until a real
+            // friend graph exists: only players in the same AC server qualify.
+            if (targetAccess === "friends" && !sameServer) {
+                return res.status(403).json({
+                    success: false,
+                    error: "Friends access currently allows same-server players only."
+                });
+            }
+
+            const pairKey = challengePairKey(fromPlayerId, toPlayerId);
+            const existingId = cleanText(
+                await upstashCommand("GET", pairKey),
+                64
+            );
+
+            if (existingId) {
+                const existing = await getChallengeRecord(existingId);
+                if (challengeIsActive(existing, now)) {
+                    return res.status(409).json({
+                        success: false,
+                        error: "An active challenge already exists between these players.",
+                        challenge: publicChallenge(existing)
+                    });
+                }
+                await upstashCommand("DEL", pairKey);
+            }
+
+            const challengeId = crypto.randomBytes(16).toString("hex");
+            const expiresAt = now + CHALLENGE_TTL_SECONDS;
+            const challenge = {
+                id: challengeId,
+                type: "beat_my_time",
+                from_player_id: fromPlayerId,
+                from_driver_name: cleanText(fromPresence?.driver_name, 100) || "Driver",
+                to_player_id: toPlayerId,
+                to_driver_name: cleanText(toPresence.driver_name, 100) || "Driver",
+                mode_key: modeKey,
+                mode_label: modeLabel,
+                target_ms: targetMs,
+                source_run_ref: sourceRunRef,
+                source_run_timestamp: sourceRunTimestamp,
+                status: "pending",
+                created_at: now,
+                accepted_at: 0,
+                expires_at: expiresAt,
+                attempts: 0,
+                best_ms: 0,
+                last_attempt_ms: 0,
+                last_attempt_at: 0,
+                beaten: false,
+                completed_at: 0,
+                terminal_at: 0,
+                result_ids: [],
+                version: 1
+            };
+
+            await upstashPipeline([
+                [
+                    "SET",
+                    challengeKey(challengeId),
+                    JSON.stringify(challenge),
+                    "EX",
+                    CHALLENGE_TTL_SECONDS
+                ],
+                ["ZADD", challengeInboxKey(toPlayerId), expiresAt, challengeId],
+                ["ZADD", challengeOutboxKey(fromPlayerId), expiresAt, challengeId],
+                ["EXPIRE", challengeInboxKey(toPlayerId), CHALLENGE_TTL_SECONDS],
+                ["EXPIRE", challengeOutboxKey(fromPlayerId), CHALLENGE_TTL_SECONDS],
+                ["SET", pairKey, challengeId, "EX", CHALLENGE_TTL_SECONDS]
+            ]);
+
+            return res.status(201).json({
+                success: true,
+                server_time: now,
+                challenge: publicChallenge(challenge)
+            });
+        } catch (error) {
+            console.error(
+                "[CHALLENGE] Create failed:",
+                error.response?.status || error.message,
+                error.response?.data || ""
+            );
+            return res.status(503).json({
+                success: false,
+                error: "The challenge could not be created."
+            });
+        }
+    }
+);
+
+app.get(
+    "/challenges",
+    requireLinkedIdentity,
+    async (req, res) => {
+        noStore(res);
+
+        try {
+            const playerId = req.mdpIdentity.acGuid;
+            const now = nowUnixSeconds();
+            const inboxKey = challengeInboxKey(playerId);
+            const outboxKey = challengeOutboxKey(playerId);
+
+            const [, , incomingIds, outgoingIds] = await upstashPipeline([
+                ["ZREMRANGEBYSCORE", inboxKey, 0, now - 1],
+                ["ZREMRANGEBYSCORE", outboxKey, 0, now - 1],
+                [
+                    "ZRANGEBYSCORE", inboxKey, now, "+inf",
+                    "LIMIT", 0, MAX_CHALLENGES_PER_LIST
+                ],
+                [
+                    "ZRANGEBYSCORE", outboxKey, now, "+inf",
+                    "LIMIT", 0, MAX_CHALLENGES_PER_LIST
+                ]
+            ]);
+
+            const incoming = Array.isArray(incomingIds) ? incomingIds : [];
+            const outgoing = Array.isArray(outgoingIds) ? outgoingIds : [];
+            const uniqueIds = [...new Set([...incoming, ...outgoing])]
+                .map((value) => cleanText(value, 64))
+                .filter((value) => /^[a-f0-9]{32}$/.test(value));
+
+            let stored = [];
+            if (uniqueIds.length > 0) {
+                stored = await upstashPipeline(
+                    uniqueIds.map((id) => ["GET", challengeKey(id)])
+                );
+            }
+
+            const byId = new Map();
+            uniqueIds.forEach((id, index) => {
+                const parsed = parseStoredJson(stored[index], "challenge record");
+                if (parsed && Number(parsed.expires_at || 0) >= now) {
+                    byId.set(id, publicChallenge(parsed));
+                }
+            });
+
+            const newestFirst = (a, b) =>
+                Number(b.created_at || 0) - Number(a.created_at || 0);
+            const incomingChallenges = incoming
+                .map((id) => byId.get(String(id)))
+                .filter(Boolean)
+                .sort(newestFirst);
+            const outgoingChallenges = outgoing
+                .map((id) => byId.get(String(id)))
+                .filter(Boolean)
+                .sort(newestFirst);
+
+            return res.status(200).json({
+                success: true,
+                server_time: now,
+                expires_in: CHALLENGE_TTL_SECONDS,
+                incoming: incomingChallenges,
+                outgoing: outgoingChallenges
+            });
+        } catch (error) {
+            console.error(
+                "[CHALLENGE] List failed:",
+                error.response?.status || error.message,
+                error.response?.data || ""
+            );
+            return res.status(503).json({
+                success: false,
+                incoming: [],
+                outgoing: [],
+                error: "Challenges are temporarily unavailable."
+            });
+        }
+    }
+);
+
+app.post(
+    "/challenges/:id/respond",
+    requireLinkedIdentity,
+    async (req, res) => {
+        noStore(res);
+
+        try {
+            const challenge = await getChallengeRecord(req.params.id);
+            const playerId = req.mdpIdentity.acGuid;
+            const action = cleanText(req.body?.action, 20).toLowerCase();
+            const now = nowUnixSeconds();
+
+            if (!challenge || Number(challenge.expires_at || 0) <= now) {
+                return res.status(404).json({ success: false, error: "Challenge expired or not found." });
+            }
+            if (challenge.to_player_id !== playerId) {
+                return res.status(403).json({ success: false, error: "Only the recipient can respond." });
+            }
+            if (challenge.status !== "pending") {
+                return res.status(409).json({ success: false, error: "Challenge has already been answered." });
+            }
+            if (action !== "accept" && action !== "decline") {
+                return res.status(400).json({ success: false, error: "Choose accept or decline." });
+            }
+
+            challenge.status = action === "accept" ? "accepted" : "declined";
+            challenge.accepted_at = action === "accept" ? now : 0;
+            challenge.terminal_at = action === "decline" ? now : 0;
+            const ttl = challengeTtlRemaining(challenge, now);
+            const commands = [[
+                "SET", challengeKey(challenge.id), JSON.stringify(challenge), "EX", ttl
+            ]];
+            if (action === "decline") {
+                commands.push(["DEL", challengePairKey(challenge.from_player_id, challenge.to_player_id)]);
+            }
+            await upstashPipeline(commands);
+
+            return res.status(200).json({
+                success: true,
+                server_time: now,
+                challenge: publicChallenge(challenge)
+            });
+        } catch (error) {
+            console.error("[CHALLENGE] Response failed:", error.response?.status || error.message);
+            return res.status(503).json({ success: false, error: "The response could not be saved." });
+        }
+    }
+);
+
+app.post(
+    "/challenges/:id/cancel",
+    requireLinkedIdentity,
+    async (req, res) => {
+        noStore(res);
+
+        try {
+            const challenge = await getChallengeRecord(req.params.id);
+            const playerId = req.mdpIdentity.acGuid;
+            const now = nowUnixSeconds();
+
+            if (!challenge || Number(challenge.expires_at || 0) <= now) {
+                return res.status(404).json({ success: false, error: "Challenge expired or not found." });
+            }
+            if (challenge.from_player_id !== playerId) {
+                return res.status(403).json({ success: false, error: "Only the challenger can cancel." });
+            }
+            if (!["pending", "accepted"].includes(challenge.status)) {
+                return res.status(409).json({ success: false, error: "Challenge is already closed." });
+            }
+
+            challenge.status = "cancelled";
+            challenge.terminal_at = now;
+            await upstashPipeline([
+                [
+                    "SET", challengeKey(challenge.id), JSON.stringify(challenge),
+                    "EX", challengeTtlRemaining(challenge, now)
+                ],
+                ["DEL", challengePairKey(challenge.from_player_id, challenge.to_player_id)]
+            ]);
+
+            return res.status(200).json({
+                success: true,
+                server_time: now,
+                challenge: publicChallenge(challenge)
+            });
+        } catch (error) {
+            console.error("[CHALLENGE] Cancel failed:", error.response?.status || error.message);
+            return res.status(503).json({ success: false, error: "The challenge could not be cancelled." });
+        }
+    }
+);
+
+app.post(
+    "/challenges/:id/result",
+    requireLinkedIdentity,
+    async (req, res) => {
+        noStore(res);
+
+        try {
+            const challenge = await getChallengeRecord(req.params.id);
+            const playerId = req.mdpIdentity.acGuid;
+            const now = nowUnixSeconds();
+            const elapsedMs = Math.round(Number(req.body?.elapsed_ms));
+            const modeKey = cleanModeKey(req.body?.mode_key);
+            const resultId = cleanText(req.body?.result_id, 100);
+            const completedAt = Math.floor(Number(req.body?.completed_at) || now);
+            const valid = req.body?.valid === true;
+
+            if (!challenge || Number(challenge.expires_at || 0) <= now) {
+                return res.status(404).json({ success: false, error: "Challenge expired or not found." });
+            }
+            if (challenge.to_player_id !== playerId) {
+                return res.status(403).json({ success: false, error: "Only the recipient can submit attempts." });
+            }
+            if (challenge.status !== "accepted") {
+                return res.status(409).json({ success: false, error: "Challenge is not active." });
+            }
+            if (!valid) {
+                return res.status(400).json({ success: false, error: "Only valid completed runs are accepted." });
+            }
+            if (!modeKey || modeKey !== challenge.mode_key) {
+                return res.status(400).json({ success: false, error: "Completed run does not match the challenge mode." });
+            }
+            if (!Number.isFinite(elapsedMs) || elapsedMs < 100 || elapsedMs > 3600000 || !resultId) {
+                return res.status(400).json({ success: false, error: "Completed result data is invalid." });
+            }
+            if (completedAt + 2 < Number(challenge.accepted_at || 0)) {
+                return res.status(400).json({ success: false, error: "Run was completed before the challenge was accepted." });
+            }
+
+            const ttl = challengeTtlRemaining(challenge, now);
+            const resultIds = Array.isArray(challenge.result_ids)
+                ? challenge.result_ids.map((value) => cleanText(value, 100))
+                : [];
+            if (resultIds.includes(resultId)) {
+                return res.status(409).json({
+                    success: false,
+                    duplicate: true,
+                    error: "This completed run was already submitted."
+                });
+            }
+            challenge.result_ids = [resultId, ...resultIds].slice(0, 20);
+
+            challenge.attempts = Number(challenge.attempts || 0) + 1;
+            challenge.last_attempt_ms = elapsedMs;
+            challenge.last_attempt_at = completedAt;
+            const previousBest = Number(challenge.best_ms || 0);
+            challenge.best_ms = previousBest > 0
+                ? Math.min(previousBest, elapsedMs)
+                : elapsedMs;
+
+            const beaten = elapsedMs < Number(challenge.target_ms || 0);
+            if (beaten) {
+                challenge.beaten = true;
+                challenge.status = "completed";
+                challenge.completed_at = now;
+                challenge.terminal_at = now;
+            }
+
+            const commands = [[
+                "SET", challengeKey(challenge.id), JSON.stringify(challenge), "EX", ttl
+            ]];
+            if (beaten) {
+                commands.push(["DEL", challengePairKey(challenge.from_player_id, challenge.to_player_id)]);
+            }
+            await upstashPipeline(commands);
+
+            return res.status(200).json({
+                success: true,
+                beaten,
+                server_time: now,
+                challenge: publicChallenge(challenge)
+            });
+        } catch (error) {
+            console.error("[CHALLENGE] Result failed:", error.response?.status || error.message);
+            return res.status(503).json({ success: false, error: "The completed result could not be saved." });
+        }
+    }
+);
+
 // This endpoint is passive: it runs only when explicitly requested. It is not
 // used as a keep-alive and therefore does not prevent Render from sleeping.
 app.get("/health", async (req, res) => {
@@ -943,7 +1518,9 @@ app.get("/health", async (req, res) => {
             upstash: redisHealthy ? "ok" : "unexpected_response",
             server_time: nowUnixSeconds(),
             presence_ttl_seconds: PRESENCE_TTL_SECONDS,
-            heartbeat_seconds: PRESENCE_HEARTBEAT_SECONDS
+            heartbeat_seconds: PRESENCE_HEARTBEAT_SECONDS,
+            beat_my_time: "enabled",
+            challenge_ttl_seconds: CHALLENGE_TTL_SECONDS
         });
     } catch (error) {
         console.error(
