@@ -33,6 +33,18 @@ const authenticatedUsers = {};
 const DISCORD_LINK_KEY_PREFIX =
     "mydragypro:oauth:";
 
+// Presence is intentionally short-lived. A client refreshes its record every
+// 45 seconds and Redis removes it automatically after 90 seconds if the game
+// closes, crashes, or loses connectivity.
+const PRESENCE_KEY_PREFIX =
+    "mydragypro:presence:";
+const PRESENCE_INDEX_KEY =
+    "mydragypro:presence:index";
+const PRESENCE_TTL_SECONDS = 90;
+const PRESENCE_HEARTBEAT_SECONDS = 45;
+const PRESENCE_STALE_SECONDS = 90;
+const MAX_VISIBLE_PLAYERS = 100;
+
 // =========================================================
 // General helpers
 // =========================================================
@@ -75,6 +87,129 @@ function upstashHeaders() {
             `Bearer ${UPSTASH_REDIS_REST_TOKEN}`,
         "Content-Type": "text/plain"
     };
+}
+
+function upstashJsonHeaders() {
+    return {
+        Authorization:
+            `Bearer ${UPSTASH_REDIS_REST_TOKEN}`,
+        "Content-Type": "application/json"
+    };
+}
+
+function upstashBaseUrl() {
+    return String(UPSTASH_REDIS_REST_URL || "")
+        .replace(/\/+$/, "");
+}
+
+// Upstash pipelines keep a heartbeat to one HTTPS round trip even though it
+// updates both the expiring record and the sorted-set index.
+async function upstashPipeline(commands) {
+    assertUpstashConfigured();
+
+    if (!Array.isArray(commands) || commands.length === 0) {
+        return [];
+    }
+
+    const response = await axios.post(
+        `${upstashBaseUrl()}/pipeline`,
+        commands,
+        {
+            headers: upstashJsonHeaders(),
+            timeout: 10000
+        }
+    );
+
+    if (!Array.isArray(response.data)) {
+        throw new Error(
+            "Upstash pipeline returned an invalid response."
+        );
+    }
+
+    return response.data.map((item, index) => {
+        if (item?.error) {
+            throw new Error(
+                `Upstash pipeline command ${index + 1} failed: ${item.error}`
+            );
+        }
+
+        return item?.result;
+    });
+}
+
+async function upstashCommand(command, ...args) {
+    const results = await upstashPipeline([
+        [command, ...args]
+    ]);
+
+    return results[0];
+}
+
+function presenceKeyForAcGuid(acGuid) {
+    return `${PRESENCE_KEY_PREFIX}${normalizeAcGuid(acGuid)}`;
+}
+
+function nowUnixSeconds() {
+    return Math.floor(Date.now() / 1000);
+}
+
+function cleanHash(value) {
+    const hash = cleanText(value, 64).toLowerCase();
+    return /^[a-f0-9]{64}$/.test(hash) ? hash : "";
+}
+
+function cleanAvailability(value) {
+    const availability = cleanText(value, 20).toLowerCase();
+
+    return ["available", "busy", "dnd"].includes(availability)
+        ? availability
+        : "available";
+}
+
+function noStore(res) {
+    res.set("Cache-Control", "no-store");
+}
+
+async function requireLinkedIdentity(req, res, next) {
+    const acGuid = normalizeAcGuid(
+        req.body?.ac_guid || req.query?.ac_guid
+    );
+
+    if (!acGuid) {
+        return res.status(400).json({
+            success: false,
+            error: "Missing Assetto Corsa identity."
+        });
+    }
+
+    try {
+        const link = await getDiscordLink(acGuid);
+
+        if (!link?.discord_id) {
+            return res.status(401).json({
+                success: false,
+                error: "Discord authentication is required."
+            });
+        }
+
+        req.mdpIdentity = {
+            acGuid,
+            discordId: link.discord_id
+        };
+
+        return next();
+    } catch (error) {
+        console.error(
+            "[PRESENCE] Identity verification unavailable:",
+            error.response?.status || error.message
+        );
+
+        return res.status(503).json({
+            success: false,
+            verification_unavailable: true,
+            error: "Identity verification is temporarily unavailable."
+        });
+    }
 }
 
 // =========================================================
@@ -540,6 +675,288 @@ app.get("/check", async (req, res) => {
             verification_unavailable: true,
             error:
                 "Discord-link verification is temporarily unavailable."
+        });
+    }
+});
+
+// =========================================================
+// MyDragyPro online presence
+// =========================================================
+
+app.post(
+    "/presence",
+    requireLinkedIdentity,
+    async (req, res) => {
+        noStore(res);
+
+        try {
+            const {
+                driver_name,
+                car_id,
+                car_name,
+                server_hash,
+                track_hash,
+                mode,
+                availability,
+                app_version
+            } = req.body || {};
+
+            const acGuid = req.mdpIdentity.acGuid;
+            const discordId = req.mdpIdentity.discordId;
+            const updatedAt = nowUnixSeconds();
+
+            const record = {
+                player_id: acGuid,
+                discord_id: discordId,
+                driver_name:
+                    cleanText(driver_name, 100) || "Driver",
+                car_id: cleanText(car_id, 100),
+                car_name: cleanText(car_name, 150),
+                server_hash: cleanHash(server_hash),
+                track_hash: cleanHash(track_hash),
+                mode: cleanText(mode, 40),
+                availability:
+                    cleanAvailability(availability),
+                app_version: cleanText(app_version, 30),
+                updated_at: updatedAt,
+                version: 1
+            };
+
+            await upstashPipeline([
+                [
+                    "SET",
+                    presenceKeyForAcGuid(acGuid),
+                    JSON.stringify(record),
+                    "EX",
+                    PRESENCE_TTL_SECONDS
+                ],
+                [
+                    "ZADD",
+                    PRESENCE_INDEX_KEY,
+                    updatedAt,
+                    acGuid
+                ]
+            ]);
+
+            return res.status(200).json({
+                success: true,
+                expires_in: PRESENCE_TTL_SECONDS,
+                next_heartbeat_in:
+                    PRESENCE_HEARTBEAT_SECONDS,
+                server_time: updatedAt
+            });
+        } catch (error) {
+            console.error(
+                "[PRESENCE] Heartbeat failed:",
+                error.response?.status || error.message,
+                error.response?.data || ""
+            );
+
+            return res.status(503).json({
+                success: false,
+                error:
+                    "Online presence is temporarily unavailable."
+            });
+        }
+    }
+);
+
+app.get(
+    "/players",
+    requireLinkedIdentity,
+    async (req, res) => {
+        noStore(res);
+
+        try {
+            const requesterGuid =
+                req.mdpIdentity.acGuid;
+            const now = nowUnixSeconds();
+            const cutoff =
+                now - PRESENCE_STALE_SECONDS;
+
+            // Cleanup and lookup are deliberately performed only when a user
+            // asks for the roster. Heartbeats never poll the player list.
+            const [, indexedIds] = await upstashPipeline([
+                [
+                    "ZREMRANGEBYSCORE",
+                    PRESENCE_INDEX_KEY,
+                    0,
+                    cutoff
+                ],
+                [
+                    "ZREVRANGEBYSCORE",
+                    PRESENCE_INDEX_KEY,
+                    now,
+                    cutoff,
+                    "LIMIT",
+                    0,
+                    MAX_VISIBLE_PLAYERS
+                ]
+            ]);
+
+            const playerIds = Array.isArray(indexedIds)
+                ? indexedIds
+                    .map((value) => normalizeAcGuid(value))
+                    .filter((value) =>
+                        value && value !== requesterGuid
+                    )
+                : [];
+
+            let storedRecords = [];
+
+            if (playerIds.length > 0) {
+                storedRecords = await upstashPipeline(
+                    playerIds.map((playerId) => [
+                        "GET",
+                        presenceKeyForAcGuid(playerId)
+                    ])
+                );
+            }
+
+            const players = [];
+
+            for (let index = 0;
+                index < playerIds.length;
+                index += 1) {
+                const storedValue = storedRecords[index];
+
+                if (!storedValue) {
+                    continue;
+                }
+
+                try {
+                    const record =
+                        typeof storedValue === "string"
+                            ? JSON.parse(storedValue)
+                            : storedValue;
+
+                    const updatedAt =
+                        Number(record?.updated_at) || 0;
+
+                    // The Discord ID remains server-side. The roster exposes
+                    // only the fields needed by the phase-one UI.
+                    players.push({
+                        player_id:
+                            cleanText(record?.player_id, 100),
+                        driver_name:
+                            cleanText(record?.driver_name, 100),
+                        car_id:
+                            cleanText(record?.car_id, 100),
+                        car_name:
+                            cleanText(record?.car_name, 150),
+                        server_hash:
+                            cleanHash(record?.server_hash),
+                        track_hash:
+                            cleanHash(record?.track_hash),
+                        mode:
+                            cleanText(record?.mode, 40),
+                        availability:
+                            cleanAvailability(
+                                record?.availability
+                            ),
+                        app_version:
+                            cleanText(record?.app_version, 30),
+                        updated_at: updatedAt,
+                        age_seconds:
+                            Math.max(0, now - updatedAt)
+                    });
+                } catch {
+                    console.warn(
+                        "[PRESENCE] Invalid record skipped:",
+                        playerIds[index]
+                    );
+                }
+            }
+
+            return res.status(200).json({
+                success: true,
+                server_time: now,
+                ttl_seconds: PRESENCE_TTL_SECONDS,
+                count: players.length,
+                players
+            });
+        } catch (error) {
+            console.error(
+                "[PRESENCE] Player-list lookup failed:",
+                error.response?.status || error.message,
+                error.response?.data || ""
+            );
+
+            return res.status(503).json({
+                success: false,
+                players: [],
+                error:
+                    "Online players are temporarily unavailable."
+            });
+        }
+    }
+);
+
+app.post(
+    "/presence/offline",
+    requireLinkedIdentity,
+    async (req, res) => {
+        noStore(res);
+
+        try {
+            const acGuid = req.mdpIdentity.acGuid;
+
+            await upstashPipeline([
+                ["DEL", presenceKeyForAcGuid(acGuid)],
+                ["ZREM", PRESENCE_INDEX_KEY, acGuid]
+            ]);
+
+            return res.status(200).json({
+                success: true,
+                server_time: nowUnixSeconds()
+            });
+        } catch (error) {
+            console.error(
+                "[PRESENCE] Offline update failed:",
+                error.response?.status || error.message,
+                error.response?.data || ""
+            );
+
+            return res.status(503).json({
+                success: false,
+                error:
+                    "Presence removal is temporarily unavailable."
+            });
+        }
+    }
+);
+
+// This endpoint is passive: it runs only when explicitly requested. It is not
+// used as a keep-alive and therefore does not prevent Render from sleeping.
+app.get("/health", async (req, res) => {
+    noStore(res);
+
+    try {
+        const redisReply = await upstashCommand("PING");
+        const redisHealthy =
+            String(redisReply || "").toUpperCase() === "PONG";
+
+        return res.status(redisHealthy ? 200 : 503).json({
+            success: redisHealthy,
+            service: "mydragypro-online-presence",
+            render: "ok",
+            upstash: redisHealthy ? "ok" : "unexpected_response",
+            server_time: nowUnixSeconds(),
+            presence_ttl_seconds: PRESENCE_TTL_SECONDS,
+            heartbeat_seconds: PRESENCE_HEARTBEAT_SECONDS
+        });
+    } catch (error) {
+        console.error(
+            "[HEALTH] Upstash check failed:",
+            error.response?.status || error.message
+        );
+
+        return res.status(503).json({
+            success: false,
+            service: "mydragypro-online-presence",
+            render: "ok",
+            upstash: "unavailable",
+            server_time: nowUnixSeconds()
         });
     }
 });
