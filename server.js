@@ -153,13 +153,15 @@ const playerPolls = new Map();
 
 
 
-function allowChallengePoll(acGuid) {
+function allowChallengePoll(acGuid, challengeType = "all") {
 
  const playerId = normalizeAcGuid(acGuid);
 
+ const pollKey = `${playerId}:${cleanChallengeType(challengeType) || "all"}`;
+
  const now = Date.now();
 
- const previous = Number(challengePolls.get(playerId)) || 0;
+ const previous = Number(challengePolls.get(pollKey)) || 0;
 
  const minimumMs = CHALLENGE_POLL_MIN_SECONDS * 1000;
 
@@ -183,7 +185,7 @@ function allowChallengePoll(acGuid) {
 
 
 
- challengePolls.set(playerId, now);
+ challengePolls.set(pollKey, now);
 
 
 
@@ -214,7 +216,10 @@ function allowChallengePoll(acGuid) {
 
 function resetChallengePollGuard(acGuid) {
 
- challengePolls.delete(normalizeAcGuid(acGuid));
+ const playerId = normalizeAcGuid(acGuid);
+ challengePolls.delete(`${playerId}:all`);
+ challengePolls.delete(`${playerId}:beat_my_time`);
+ challengePolls.delete(`${playerId}:touge`);
 
 }
 
@@ -569,6 +574,27 @@ function cleanModeKey(value) {
 
 }
 
+function cleanChallengeType(value) {
+ const type = cleanText(value, 40).toLowerCase();
+ return type === "touge" ? "touge" : type === "beat_my_time" ? "beat_my_time" : "";
+}
+
+const TOUGE_RULES = Object.freeze({
+ beginner: Object.freeze({ gap_limit_m: 300, grace_seconds: 4 }),
+ intermediate: Object.freeze({ gap_limit_m: 200, grace_seconds: 3 }),
+ pro: Object.freeze({ gap_limit_m: 100, grace_seconds: 2 })
+});
+
+function cleanTougeDifficulty(value) {
+ const key = cleanText(value, 20).toLowerCase();
+ return Object.prototype.hasOwnProperty.call(TOUGE_RULES, key) ? key : "intermediate";
+}
+
+function cleanTougeRole(value) {
+ const role = cleanText(value, 20).toLowerCase();
+ return role === "follower" ? "follower" : "leader";
+}
+
 
 
 
@@ -721,6 +747,8 @@ function publicChallenge(challenge) {
 
  if (!challenge || typeof challenge !== "object") return null;
 
+ const type = cleanChallengeType(challenge.type) || "beat_my_time";
+
 
 
 
@@ -728,7 +756,7 @@ function publicChallenge(challenge) {
 
  id: cleanText(challenge.id, 64),
 
- type: "beat_my_time",
+ type,
 
  from_player_id: cleanText(challenge.from_player_id, 100),
 
@@ -737,6 +765,24 @@ function publicChallenge(challenge) {
  to_player_id: cleanText(challenge.to_player_id, 100),
 
  to_driver_name: cleanText(challenge.to_driver_name, 100),
+
+ from_car_id: cleanText(challenge.from_car_id, 100),
+
+ to_car_id: cleanText(challenge.to_car_id, 100),
+
+ server_hash: cleanHash(challenge.server_hash),
+
+ track_hash: cleanHash(challenge.track_hash),
+
+ challenger_role: type === "touge" ? cleanTougeRole(challenge.challenger_role) : "",
+
+ difficulty: type === "touge" ? cleanTougeDifficulty(challenge.difficulty) : "",
+
+ gap_limit_m: Number(challenge.gap_limit_m) || 0,
+
+ grace_seconds: Number(challenge.grace_seconds) || 0,
+
+ duration_seconds: Number(challenge.duration_seconds) || 0,
 
  mode_key: cleanModeKey(challenge.mode_key),
 
@@ -769,6 +815,20 @@ function publicChallenge(challenge) {
  completed_at: Number(challenge.completed_at) || 0,
 
  terminal_at: Number(challenge.terminal_at) || 0,
+
+ winner_player_id: cleanText(challenge.winner_player_id, 100),
+
+ winner_role: cleanText(challenge.winner_role, 20),
+
+ result_reason: cleanText(challenge.result_reason, 80),
+
+ result_elapsed_ms: Number(challenge.result_elapsed_ms) || 0,
+
+ final_gap_m: Number(challenge.final_gap_m) || 0,
+
+ min_gap_m: Number(challenge.min_gap_m) || 0,
+
+ max_gap_m: Number(challenge.max_gap_m) || 0,
 
  version: 1
 
@@ -2488,13 +2548,13 @@ app.post(
 
  );
 
- const type = cleanText(req.body?.type, 40).toLowerCase();
+ const type = cleanChallengeType(req.body?.type);
 
- const modeKey = cleanModeKey(req.body?.mode_key);
+ let modeKey = cleanModeKey(req.body?.mode_key);
 
- const modeLabel = cleanText(req.body?.mode_label, 120);
+ let modeLabel = cleanText(req.body?.mode_label, 120);
 
- const targetMs = Math.round(Number(req.body?.target_ms));
+ let targetMs = Math.round(Number(req.body?.target_ms));
 
  const sourceRunRef = cleanText(req.body?.source_run_ref, 100);
 
@@ -2519,7 +2579,7 @@ app.post(
 
  }
 
- if (type !== "beat_my_time") {
+ if (type !== "beat_my_time" && type !== "touge") {
 
  return res.status(400).json({
 
@@ -2529,6 +2589,12 @@ app.post(
 
  });
 
+ }
+
+ if (type === "touge") {
+ modeKey = "touge:basic";
+ modeLabel = "Basic Touge";
+ targetMs = 0;
  }
 
  if (!modeKey || !modeLabel) {
@@ -2543,7 +2609,8 @@ app.post(
 
  }
 
- if (!Number.isFinite(targetMs) || targetMs < 100 || targetMs > 3600000) {
+ if (type === "beat_my_time"
+ && (!Number.isFinite(targetMs) || targetMs < 100 || targetMs > 3600000)) {
 
  return res.status(400).json({
 
@@ -2603,6 +2670,13 @@ app.post(
  const sameServer = cleanHash(fromPresence?.server_hash) !== ""
 
  && cleanHash(fromPresence?.server_hash) === cleanHash(toPresence.server_hash);
+
+ if (type === "touge" && !sameServer) {
+ return res.status(409).json({
+ success: false,
+ error: "Basic Touge requires both players on the same server."
+ });
+ }
 
 
 
@@ -2680,11 +2754,15 @@ app.post(
 
  const expiresAt = now + CHALLENGE_TTL_SECONDS;
 
+ const tougeDifficulty = cleanTougeDifficulty(req.body?.difficulty);
+ const tougeRules = TOUGE_RULES[tougeDifficulty];
+ const challengerRole = cleanTougeRole(req.body?.challenger_role);
+
  const challenge = {
 
  id: challengeId,
 
- type: "beat_my_time",
+ type,
 
  from_player_id: fromPlayerId,
 
@@ -2693,6 +2771,24 @@ app.post(
  to_player_id: toPlayerId,
 
  to_driver_name: cleanText(toPresence.driver_name, 100) || "Driver",
+
+ from_car_id: cleanText(fromPresence?.car_id, 100),
+
+ to_car_id: cleanText(toPresence.car_id, 100),
+
+ server_hash: type === "touge" ? cleanHash(toPresence.server_hash) : "",
+
+ track_hash: type === "touge" ? cleanHash(toPresence.track_hash) : "",
+
+ challenger_role: type === "touge" ? challengerRole : "",
+
+ difficulty: type === "touge" ? tougeDifficulty : "",
+
+ gap_limit_m: type === "touge" ? tougeRules.gap_limit_m : 0,
+
+ grace_seconds: type === "touge" ? tougeRules.grace_seconds : 0,
+
+ duration_seconds: type === "touge" ? 180 : 0,
 
  mode_key: modeKey,
 
@@ -2728,7 +2824,21 @@ app.post(
 
  result_ids: [],
 
- version: 1
+ winner_player_id: "",
+
+ winner_role: "",
+
+ result_reason: "",
+
+ result_elapsed_ms: 0,
+
+ final_gap_m: 0,
+
+ min_gap_m: 0,
+
+ max_gap_m: 0,
+
+ version: type === "touge" ? 2 : 1
 
  };
 
@@ -2825,7 +2935,10 @@ app.get(
 
  const playerId = req.mdpIdentity.acGuid;
 
- const poll = allowChallengePoll(playerId);
+ // Missing type preserves the phase-two contract for older Beat My Time clients.
+ const requestedType = cleanChallengeType(req.query?.type) || "beat_my_time";
+
+ const poll = allowChallengePoll(playerId, requestedType);
 
  if (!poll.allowed) {
 
@@ -2920,7 +3033,9 @@ app.get(
 
  const parsed = parseStoredJson(stored[index], "challenge record");
 
- if (parsed && Number(parsed.expires_at || 0) >= now) {
+ const parsedType = cleanChallengeType(parsed?.type) || "beat_my_time";
+ if (parsed && Number(parsed.expires_at || 0) >= now
+ && (requestedType === "all" || parsedType === requestedType)) {
 
  byId.set(id, publicChallenge(parsed));
 
@@ -3242,9 +3357,14 @@ app.post(
 
  }
 
- if (challenge.to_player_id !== playerId) {
+ const challengeType = cleanChallengeType(challenge.type) || "beat_my_time";
+ const isParticipant = challenge.from_player_id === playerId
+ || challenge.to_player_id === playerId;
 
- return res.status(403).json({ success: false, error: "Only the recipient can submit attempts." });
+ if ((challengeType === "beat_my_time" && challenge.to_player_id !== playerId)
+ || (challengeType === "touge" && !isParticipant)) {
+
+ return res.status(403).json({ success: false, error: "Only a challenge participant can submit this result." });
 
  }
 
@@ -3258,6 +3378,66 @@ app.post(
 
  return res.status(400).json({ success: false, error: "Only valid completed runs are accepted." });
 
+ }
+
+ if (challengeType === "touge") {
+ const winnerPlayerId = normalizeAcGuid(req.body?.winner_player_id);
+ const winnerRole = cleanText(req.body?.winner_role, 20).toLowerCase();
+ const resultReason = cleanText(req.body?.reason, 80).toLowerCase();
+ const finalGapM = Number(req.body?.final_gap_m);
+ const minGapM = Number(req.body?.min_gap_m);
+ const maxGapM = Number(req.body?.max_gap_m);
+ const participants = [challenge.from_player_id, challenge.to_player_id];
+ const allowedReasons = new Set([
+ "escape_sustained", "duration_survived",
+ "local_reset_or_teleport", "opponent_reset_or_teleport",
+ "opponent_lost_or_disconnected", "local_stopped_forfeit",
+ "opponent_stopped_forfeit"
+ ]);
+
+ if (!resultId || !participants.includes(winnerPlayerId)
+ || !["leader", "follower"].includes(winnerRole)
+ || !allowedReasons.has(resultReason)
+ || !Number.isFinite(elapsedMs) || elapsedMs < 0 || elapsedMs > 300000
+ || completedAt + 2 < Number(challenge.accepted_at || 0)) {
+ return res.status(400).json({ success: false, error: "Completed Touge result data is invalid." });
+ }
+
+ const resultIds = Array.isArray(challenge.result_ids)
+ ? challenge.result_ids.map((value) => cleanText(value, 100)) : [];
+ if (resultIds.includes(resultId)) {
+ return res.status(409).json({
+ success: false,
+ duplicate: true,
+ error: "This Touge result was already submitted."
+ });
+ }
+
+ challenge.result_ids = [resultId, ...resultIds].slice(0, 20);
+ challenge.status = "completed";
+ challenge.completed_at = now;
+ challenge.terminal_at = now;
+ challenge.winner_player_id = winnerPlayerId;
+ challenge.winner_role = winnerRole;
+ challenge.result_reason = resultReason;
+ challenge.result_elapsed_ms = elapsedMs;
+ challenge.final_gap_m = Number.isFinite(finalGapM) ? Math.max(0, finalGapM) : 0;
+ challenge.min_gap_m = Number.isFinite(minGapM) ? Math.max(0, minGapM) : 0;
+ challenge.max_gap_m = Number.isFinite(maxGapM) ? Math.max(0, maxGapM) : 0;
+
+ const ttl = challengeTtlRemaining(challenge, now);
+ await upstashPipeline([
+ ["SET", challengeKey(challenge.id), JSON.stringify(challenge), "EX", ttl],
+ ["DEL", challengePairKey(challenge.from_player_id, challenge.to_player_id)]
+ ]);
+ resetChallengePollGuard(challenge.from_player_id);
+ resetChallengePollGuard(challenge.to_player_id);
+
+ return res.status(200).json({
+ success: true,
+ server_time: now,
+ challenge: publicChallenge(challenge)
+ });
  }
 
  if (!modeKey || modeKey !== challenge.mode_key) {
