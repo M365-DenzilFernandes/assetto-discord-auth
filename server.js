@@ -55,10 +55,11 @@ const MAX_CHALLENGES_PER_LIST = 100;
 // are staging, and Redis atomically creates or cancels one shared start time.
 const TOUGE_READY_STALE_MS = 2500;
 const TOUGE_START_LEAD_MS = 4000;
-// The official client polls every 45 seconds. Keep a small drift allowance while
-// preventing modified clients from repeatedly consuming Redis commands. This
-// process-local guard deliberately uses no Upstash operations.
-const CHALLENGE_POLL_MIN_SECONDS = 40;
+// Beat My Time keeps the original conservative polling guard.
+// Live Touge challenges poll more frequently so acceptance is discovered
+// quickly, while still preventing rapid repeated requests.
+const BEAT_MY_TIME_POLL_MIN_SECONDS = 40;
+const TOUGE_POLL_MIN_SECONDS = 8;
 const challengePolls = new Map();
 // The Players roster follows the same 45-second official-client cadence. This
 // process-local guard rejects faster polling before any Redis command is issued.
@@ -66,10 +67,17 @@ const PLAYER_POLL_MIN_SECONDS = 40;
 const playerPolls = new Map();
 function allowChallengePoll(acGuid, challengeType = "all") {
     const playerId = normalizeAcGuid(acGuid);
-    const pollKey = `${playerId}:${cleanChallengeType(challengeType) || "all"}`;
+    const type = cleanChallengeType(challengeType) || "all";
+    const pollKey = `${playerId}:${type}`;
     const now = Date.now();
+    // Touge needs faster acceptance discovery because it is a live
+    // head-to-head experience. Beat My Time keeps the original guard.
+    const minimumSeconds =
+        type === "touge"
+            ? TOUGE_POLL_MIN_SECONDS
+            : BEAT_MY_TIME_POLL_MIN_SECONDS;
+    const minimumMs = minimumSeconds * 1000;
     const previous = Number(challengePolls.get(pollKey)) || 0;
-    const minimumMs = CHALLENGE_POLL_MIN_SECONDS * 1000;
     const waitMs = minimumMs - (now - previous);
     if (waitMs > 0) {
         return {
@@ -78,9 +86,15 @@ function allowChallengePoll(acGuid, challengeType = "all") {
         };
     }
     challengePolls.set(pollKey, now);
-    // Bound stale process memory without adding timers or external storage.
+    // Bound stale process memory without timers or Redis operations.
     if (challengePolls.size > 10000) {
-        const staleBefore = now - (minimumMs * 3);
+        const staleBefore =
+            now - (
+                Math.max(
+                    BEAT_MY_TIME_POLL_MIN_SECONDS,
+                    TOUGE_POLL_MIN_SECONDS
+                ) * 1000 * 3
+            );
         for (const [key, timestamp] of challengePolls) {
             if (Number(timestamp) < staleBefore) challengePolls.delete(key);
         }
@@ -299,9 +313,9 @@ local existing_from_seen = tonumber(redis.call('HGET', key, 'from_seen_ms')) or 
 local existing_to_seen = tonumber(redis.call('HGET', key, 'to_seen_ms')) or 0
 
 if start_at > 0 and start_at <= now then
-  redis.call('PEXPIRE', key, ttl)
-  return { existing_from_ready, existing_to_ready, start_at, generation,
-      existing_from_seen, existing_to_seen }
+ redis.call('PEXPIRE', key, ttl)
+ return { existing_from_ready, existing_to_ready, start_at, generation,
+ existing_from_seen, existing_to_seen }
 end
 
 redis.call('HSET', key, actor .. '_ready', ready, actor .. '_seen_ms', now)
@@ -312,24 +326,24 @@ local from_seen = tonumber(redis.call('HGET', key, 'from_seen_ms')) or 0
 local to_seen = tonumber(redis.call('HGET', key, 'to_seen_ms')) or 0
 
 if from_seen <= 0 or now - from_seen > stale then
-  from_ready = 0
-  redis.call('HSET', key, 'from_ready', 0)
+ from_ready = 0
+ redis.call('HSET', key, 'from_ready', 0)
 end
 if to_seen <= 0 or now - to_seen > stale then
-  to_ready = 0
-  redis.call('HSET', key, 'to_ready', 0)
+ to_ready = 0
+ redis.call('HSET', key, 'to_ready', 0)
 end
 
 local both_ready = from_ready == 1 and to_ready == 1
 
 if start_at > now and not both_ready then
-  start_at = 0
-  generation = generation + 1
-  redis.call('HSET', key, 'start_at_ms', 0, 'generation', generation)
+ start_at = 0
+ generation = generation + 1
+ redis.call('HSET', key, 'start_at_ms', 0, 'generation', generation)
 elseif start_at <= 0 and both_ready then
-  start_at = now + lead
-  generation = generation + 1
-  redis.call('HSET', key, 'start_at_ms', start_at, 'generation', generation)
+ start_at = now + lead
+ generation = generation + 1
+ redis.call('HSET', key, 'start_at_ms', start_at, 'generation', generation)
 end
 
 redis.call('PEXPIRE', key, ttl)
@@ -577,7 +591,7 @@ app.get("/login", (req, res) => {
 });
 function renderAuthPage({ success, title, message }) {
     const accent = success ? "#55d68b" : "#ff5c70";
-    const icon = success ? "Ã¢Å“â€œ" : "!";
+    const icon = success ? "ÃƒÂ¢Ã…â€œÃ¢â‚¬Å“" : "!";
     const status = success ? "Discord Connected" : "Connection Failed";
     return `<!DOCTYPE html>
 <html lang="en">
@@ -1810,7 +1824,7 @@ app.post(
                 embeds: [
                     {
                         title:
-                            "Ã°Å¸ÂÂ New Sponsored Track Request",
+                            "ÃƒÂ°Ã…Â¸Ã‚ÂÃ‚Â New Sponsored Track Request",
                         color: 5763719,
                         fields: [
                             {
