@@ -15,6 +15,84 @@ const UPSTASH_REDIS_REST_URL =
     process.env.UPSTASH_REDIS_REST_URL;
 const UPSTASH_REDIS_REST_TOKEN =
     process.env.UPSTASH_REDIS_REST_TOKEN;
+// Remote operational configuration is edited manually in the Upstash Data
+// Browser. The server validates it, caches it, and exposes only the client-safe
+// subset through GET /config.
+const ONLINE_CONFIG_KEY = "mydragypro:config:online";
+const ONLINE_CONFIG_SERVER_CACHE_MS = 5 * 60 * 1000;
+const DEFAULT_ONLINE_CONFIG = Object.freeze({
+    version: 1,
+    network: {
+        config_refresh_seconds: 300,
+        presence_heartbeat_seconds: 45,
+        presence_ttl_seconds: 90,
+        players_refresh_seconds: 45,
+        beat_my_time_idle_refresh_seconds: 45,
+        beat_my_time_active_refresh_seconds: 8,
+        touge_idle_refresh_seconds: 45,
+        touge_active_refresh_seconds: 8,
+        touge_sync_refresh_seconds: 1,
+        retry_seconds: 10,
+        refresh_offset_seconds: 3
+    },
+    features: {
+        online_presence: true,
+        players: true,
+        challenges: true,
+        beat_my_time: true,
+        touge: true,
+        touge_sync: true
+    },
+    limits: {
+        max_visible_players: 100,
+        max_challenges_per_list: 100,
+        player_poll_min_seconds: 40,
+        beat_my_time_poll_min_seconds: 8,
+        touge_poll_min_seconds: 8
+    },
+    challenges: {
+        ttl_seconds: 7200,
+        beat_my_time: { pending_timeout_seconds: 300 },
+        touge: {
+            pending_timeout_seconds: 300,
+            ready_stale_ms: 2500,
+            start_lead_ms: 4000,
+            duration_seconds: 180
+        }
+    },
+    touge_rules: {
+        beginner: { gap_limit_m: 300, grace_seconds: 4 },
+        intermediate: { gap_limit_m: 200, grace_seconds: 3 },
+        pro: { gap_limit_m: 100, grace_seconds: 2 }
+    },
+    client: {
+        minimum_online_version: "3.0.30",
+        recommended_version: "3.0.50"
+    },
+    service: {
+        online_enabled: true,
+        maintenance: false,
+        maintenance_message: ""
+    },
+    experience: {
+        challenge_notification_seconds: 8,
+        results_retention_seconds: 7200,
+        show_offline_banner: true,
+        show_update_notice: true
+    },
+    announcement: {
+        enabled: false,
+        id: "",
+        severity: "info",
+        message: ""
+    }
+});
+let onlineConfigCache = {
+    config: DEFAULT_ONLINE_CONFIG,
+    loadedAtMs: 0,
+    source: "defaults",
+    lastError: ""
+};
 // Short-lived process cache.
 //
 // Upstash Redis is the durable source of truth.
@@ -24,17 +102,10 @@ const authenticatedUsers = {};
 // Redis key namespace.
 const DISCORD_LINK_KEY_PREFIX =
     "mydragypro:oauth:";
-// Presence is intentionally short-lived. A client refreshes its record every
-// 45 seconds and Redis removes it automatically after 90 seconds if the game
-// closes, crashes, or loses connectivity.
 const PRESENCE_KEY_PREFIX =
     "mydragypro:presence:";
 const PRESENCE_INDEX_KEY =
     "mydragypro:presence:index";
-const PRESENCE_TTL_SECONDS = 90;
-const PRESENCE_HEARTBEAT_SECONDS = 45;
-const PRESENCE_STALE_SECONDS = 90;
-const MAX_VISIBLE_PLAYERS = 100;
 // Beat My Time challenge records are short-lived coordination messages. Run
 // timing remains entirely client-side; only completed, validated result data is
 // submitted here.
@@ -48,22 +119,7 @@ const CHALLENGE_PAIR_PREFIX =
     "mydragypro:challenge-pair:";
 const TOUGE_SYNC_KEY_PREFIX =
     "mydragypro:touge-sync:";
-const CHALLENGE_TTL_SECONDS = 2 * 60 * 60;
-const MAX_CHALLENGES_PER_LIST = 100;
-// Touge synchronization is deliberately separate from the 45-second challenge
-// list polling guard. Ready clients heartbeat this short-lived state while they
-// are staging, and Redis atomically creates or cancels one shared start time.
-const TOUGE_READY_STALE_MS = 2500;
-const TOUGE_START_LEAD_MS = 4000;
-// Beat My Time keeps the original conservative polling guard.
-// Live Touge challenges poll more frequently so acceptance is discovered
-// quickly, while still preventing rapid repeated requests.
-const BEAT_MY_TIME_POLL_MIN_SECONDS = 40;
-const TOUGE_POLL_MIN_SECONDS = 8;
 const challengePolls = new Map();
-// The Players roster follows the same 45-second official-client cadence. This
-// process-local guard rejects faster polling before any Redis command is issued.
-const PLAYER_POLL_MIN_SECONDS = 40;
 const playerPolls = new Map();
 function allowChallengePoll(acGuid, challengeType = "all") {
     const playerId = normalizeAcGuid(acGuid);
@@ -72,10 +128,10 @@ function allowChallengePoll(acGuid, challengeType = "all") {
     const now = Date.now();
     // Touge needs faster acceptance discovery because it is a live
     // head-to-head experience. Beat My Time keeps the original guard.
-    const minimumSeconds =
-        type === "touge"
-            ? TOUGE_POLL_MIN_SECONDS
-            : BEAT_MY_TIME_POLL_MIN_SECONDS;
+    const limits = getCachedOnlineConfig().limits;
+    const minimumSeconds = type === "touge"
+        ? limits.touge_poll_min_seconds
+        : limits.beat_my_time_poll_min_seconds;
     const minimumMs = minimumSeconds * 1000;
     const previous = Number(challengePolls.get(pollKey)) || 0;
     const waitMs = minimumMs - (now - previous);
@@ -91,8 +147,8 @@ function allowChallengePoll(acGuid, challengeType = "all") {
         const staleBefore =
             now - (
                 Math.max(
-                    BEAT_MY_TIME_POLL_MIN_SECONDS,
-                    TOUGE_POLL_MIN_SECONDS
+                    limits.beat_my_time_poll_min_seconds,
+                    limits.touge_poll_min_seconds
                 ) * 1000 * 3
             );
         for (const [key, timestamp] of challengePolls) {
@@ -111,7 +167,7 @@ function allowPlayerPoll(acGuid) {
     const playerId = normalizeAcGuid(acGuid);
     const now = Date.now();
     const previous = Number(playerPolls.get(playerId)) || 0;
-    const minimumMs = PLAYER_POLL_MIN_SECONDS * 1000;
+    const minimumMs = getCachedOnlineConfig().limits.player_poll_min_seconds * 1000;
     const waitMs = minimumMs - (now - previous);
     if (waitMs > 0) {
         return {
@@ -212,6 +268,187 @@ async function upstashCommand(command, ...args) {
     ]);
     return results[0];
 }
+
+function clampNumber(value, fallback, minimum, maximum, integer = false) {
+    const parsed = Number(value);
+    let result = Number.isFinite(parsed) ? parsed : Number(fallback);
+    result = Math.max(minimum, Math.min(maximum, result));
+    return integer ? Math.round(result) : result;
+}
+function configBoolean(value, fallback) {
+    return typeof value === "boolean" ? value : fallback === true;
+}
+function configText(value, fallback, maxLength) {
+    return typeof value === "string"
+        ? cleanText(value, maxLength)
+        : cleanText(fallback, maxLength);
+}
+function versionText(value, fallback = "") {
+    const version = configText(value, fallback, 30).replace(/^v/i, "");
+    return /^\d+(?:\.\d+){0,3}(?:[-+][0-9A-Za-z.-]+)?$/.test(version)
+        ? version
+        : String(fallback || "").replace(/^v/i, "");
+}
+function validateOnlineConfig(raw) {
+    const source = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
+    const defaults = DEFAULT_ONLINE_CONFIG;
+    const network = source.network && typeof source.network === "object" ? source.network : {};
+    const features = source.features && typeof source.features === "object" ? source.features : {};
+    const limits = source.limits && typeof source.limits === "object" ? source.limits : {};
+    const challenges = source.challenges && typeof source.challenges === "object" ? source.challenges : {};
+    const beat = challenges.beat_my_time && typeof challenges.beat_my_time === "object"
+        ? challenges.beat_my_time : {};
+    const touge = challenges.touge && typeof challenges.touge === "object" ? challenges.touge : {};
+    const rules = source.touge_rules && typeof source.touge_rules === "object" ? source.touge_rules : {};
+    const client = source.client && typeof source.client === "object" ? source.client : {};
+    const service = source.service && typeof source.service === "object" ? source.service : {};
+    const experience = source.experience && typeof source.experience === "object" ? source.experience : {};
+    const announcement = source.announcement && typeof source.announcement === "object"
+        ? source.announcement : {};
+
+    const validated = {
+        version: clampNumber(source.version, defaults.version, 1, 1000000, true),
+        network: {
+            config_refresh_seconds: clampNumber(network.config_refresh_seconds, defaults.network.config_refresh_seconds, 60, 1800, true),
+            presence_heartbeat_seconds: clampNumber(network.presence_heartbeat_seconds, defaults.network.presence_heartbeat_seconds, 15, 300, true),
+            presence_ttl_seconds: clampNumber(network.presence_ttl_seconds, defaults.network.presence_ttl_seconds, 30, 900, true),
+            players_refresh_seconds: clampNumber(network.players_refresh_seconds, defaults.network.players_refresh_seconds, 15, 300, true),
+            beat_my_time_idle_refresh_seconds: clampNumber(network.beat_my_time_idle_refresh_seconds, defaults.network.beat_my_time_idle_refresh_seconds, 15, 300, true),
+            beat_my_time_active_refresh_seconds: clampNumber(network.beat_my_time_active_refresh_seconds, defaults.network.beat_my_time_active_refresh_seconds, 5, 60, true),
+            touge_idle_refresh_seconds: clampNumber(network.touge_idle_refresh_seconds, defaults.network.touge_idle_refresh_seconds, 15, 300, true),
+            touge_active_refresh_seconds: clampNumber(network.touge_active_refresh_seconds, defaults.network.touge_active_refresh_seconds, 5, 60, true),
+            touge_sync_refresh_seconds: clampNumber(network.touge_sync_refresh_seconds, defaults.network.touge_sync_refresh_seconds, 0.5, 5),
+            retry_seconds: clampNumber(network.retry_seconds, defaults.network.retry_seconds, 5, 120, true),
+            refresh_offset_seconds: clampNumber(network.refresh_offset_seconds, defaults.network.refresh_offset_seconds, 0, 30, true)
+        },
+        features: {
+            online_presence: configBoolean(features.online_presence, defaults.features.online_presence),
+            players: configBoolean(features.players, defaults.features.players),
+            challenges: configBoolean(features.challenges, defaults.features.challenges),
+            beat_my_time: configBoolean(features.beat_my_time, defaults.features.beat_my_time),
+            touge: configBoolean(features.touge, defaults.features.touge),
+            touge_sync: configBoolean(features.touge_sync, defaults.features.touge_sync)
+        },
+        limits: {
+            max_visible_players: clampNumber(limits.max_visible_players, defaults.limits.max_visible_players, 1, 500, true),
+            max_challenges_per_list: clampNumber(limits.max_challenges_per_list, defaults.limits.max_challenges_per_list, 1, 250, true),
+            player_poll_min_seconds: clampNumber(limits.player_poll_min_seconds, defaults.limits.player_poll_min_seconds, 5, 300, true),
+            beat_my_time_poll_min_seconds: clampNumber(limits.beat_my_time_poll_min_seconds, defaults.limits.beat_my_time_poll_min_seconds, 5, 300, true),
+            touge_poll_min_seconds: clampNumber(limits.touge_poll_min_seconds, defaults.limits.touge_poll_min_seconds, 5, 60, true)
+        },
+        challenges: {
+            ttl_seconds: clampNumber(challenges.ttl_seconds, defaults.challenges.ttl_seconds, 300, 86400, true),
+            beat_my_time: {
+                pending_timeout_seconds: clampNumber(beat.pending_timeout_seconds, defaults.challenges.beat_my_time.pending_timeout_seconds, 30, 3600, true)
+            },
+            touge: {
+                pending_timeout_seconds: clampNumber(touge.pending_timeout_seconds, defaults.challenges.touge.pending_timeout_seconds, 30, 3600, true),
+                ready_stale_ms: clampNumber(touge.ready_stale_ms, defaults.challenges.touge.ready_stale_ms, 1000, 10000, true),
+                start_lead_ms: clampNumber(touge.start_lead_ms, defaults.challenges.touge.start_lead_ms, 2000, 10000, true),
+                duration_seconds: clampNumber(touge.duration_seconds, defaults.challenges.touge.duration_seconds, 30, 900, true)
+            }
+        },
+        touge_rules: {},
+        client: {
+            minimum_online_version: versionText(client.minimum_online_version, defaults.client.minimum_online_version),
+            recommended_version: versionText(client.recommended_version, defaults.client.recommended_version)
+        },
+        service: {
+            online_enabled: configBoolean(service.online_enabled, defaults.service.online_enabled),
+            maintenance: configBoolean(service.maintenance, defaults.service.maintenance),
+            maintenance_message: configText(service.maintenance_message, defaults.service.maintenance_message, 240)
+        },
+        experience: {
+            challenge_notification_seconds: clampNumber(experience.challenge_notification_seconds, defaults.experience.challenge_notification_seconds, 2, 30, true),
+            results_retention_seconds: clampNumber(experience.results_retention_seconds, defaults.experience.results_retention_seconds, 60, 86400, true),
+            show_offline_banner: configBoolean(experience.show_offline_banner, defaults.experience.show_offline_banner),
+            show_update_notice: configBoolean(experience.show_update_notice, defaults.experience.show_update_notice)
+        },
+        announcement: {
+            enabled: configBoolean(announcement.enabled, defaults.announcement.enabled),
+            id: configText(announcement.id, defaults.announcement.id, 80),
+            severity: ["info", "warning", "critical"].includes(String(announcement.severity || "").toLowerCase())
+                ? String(announcement.severity).toLowerCase() : defaults.announcement.severity,
+            message: configText(announcement.message, defaults.announcement.message, 500)
+        }
+    };
+
+    for (const key of ["beginner", "intermediate", "pro"]) {
+        const candidate = rules[key] && typeof rules[key] === "object" ? rules[key] : {};
+        validated.touge_rules[key] = {
+            gap_limit_m: clampNumber(candidate.gap_limit_m, defaults.touge_rules[key].gap_limit_m, 25, 1000, true),
+            grace_seconds: clampNumber(candidate.grace_seconds, defaults.touge_rules[key].grace_seconds, 1, 15)
+        };
+    }
+    // Presence records must outlive a heartbeat by a safe margin.
+    validated.network.presence_ttl_seconds = Math.max(
+        validated.network.presence_ttl_seconds,
+        validated.network.presence_heartbeat_seconds + 15
+    );
+    return validated;
+}
+function getCachedOnlineConfig() {
+    return onlineConfigCache.config || DEFAULT_ONLINE_CONFIG;
+}
+async function getOnlineConfig(force = false) {
+    const now = Date.now();
+    if (!force && onlineConfigCache.loadedAtMs > 0
+        && now - onlineConfigCache.loadedAtMs < ONLINE_CONFIG_SERVER_CACHE_MS) {
+        return onlineConfigCache.config;
+    }
+    try {
+        const stored = await upstashCommand("GET", ONLINE_CONFIG_KEY);
+        const parsed = parseStoredJson(stored, "online configuration");
+        const config = validateOnlineConfig(parsed || DEFAULT_ONLINE_CONFIG);
+        onlineConfigCache = {
+            config,
+            loadedAtMs: now,
+            source: parsed ? "upstash" : "defaults_missing_key",
+            lastError: ""
+        };
+        return config;
+    } catch (error) {
+        onlineConfigCache = {
+            config: getCachedOnlineConfig(),
+            loadedAtMs: now,
+            source: onlineConfigCache.loadedAtMs > 0 ? "stale_cache" : "defaults_error",
+            lastError: String(error?.message || error)
+        };
+        console.error("[CONFIG] Using safe cached/default configuration:", onlineConfigCache.lastError);
+        return onlineConfigCache.config;
+    }
+}
+function publicOnlineConfig(config) {
+    const { limits: _serverOnlyLimits, ...safe } = config;
+    return safe;
+}
+function compareVersions(left, right) {
+    const parts = (value) => String(value || "").replace(/^v/i, "").split(/[.+-]/)[0]
+        .split(".").map((part) => Number(part) || 0);
+    const a = parts(left);
+    const b = parts(right);
+    for (let index = 0; index < Math.max(a.length, b.length, 4); index += 1) {
+        if ((a[index] || 0) !== (b[index] || 0)) return (a[index] || 0) < (b[index] || 0) ? -1 : 1;
+    }
+    return 0;
+}
+function serviceUnavailable(config) {
+    return config.service.online_enabled !== true || config.service.maintenance === true;
+}
+function onlineUnavailableResponse(res, config, featureName = "online services") {
+    const message = config.service.maintenance_message
+        || `${featureName} are temporarily unavailable.`;
+    return res.status(503).json({
+        success: false,
+        maintenance: config.service.maintenance === true,
+        online_enabled: config.service.online_enabled === true,
+        error: message
+    });
+}
+async function attachOnlineConfig(req, _res, next) {
+    req.mdpOnlineConfig = await getOnlineConfig();
+    next();
+}
 function presenceKeyForAcGuid(acGuid) {
     return `${PRESENCE_KEY_PREFIX}${normalizeAcGuid(acGuid)}`;
 }
@@ -244,14 +481,10 @@ function cleanChallengeType(value) {
     const type = cleanText(value, 40).toLowerCase();
     return type === "touge" ? "touge" : type === "beat_my_time" ? "beat_my_time" : "";
 }
-const TOUGE_RULES = Object.freeze({
-    beginner: Object.freeze({ gap_limit_m: 300, grace_seconds: 4 }),
-    intermediate: Object.freeze({ gap_limit_m: 200, grace_seconds: 3 }),
-    pro: Object.freeze({ gap_limit_m: 100, grace_seconds: 2 })
-});
+const TOUGE_DIFFICULTIES = new Set(["beginner", "intermediate", "pro"]);
 function cleanTougeDifficulty(value) {
     const key = cleanText(value, 20).toLowerCase();
-    return Object.prototype.hasOwnProperty.call(TOUGE_RULES, key) ? key : "intermediate";
+    return TOUGE_DIFFICULTIES.has(key) ? key : "intermediate";
 }
 function cleanTougeRole(value) {
     const role = cleanText(value, 20).toLowerCase();
@@ -864,6 +1097,17 @@ app.get("/check", async (req, res) => {
         });
     }
 });
+app.get("/config", async (_req, res) => {
+    noStore(res);
+    const config = await getOnlineConfig();
+    return res.status(200).json({
+        success: true,
+        server_time: nowUnixSeconds(),
+        source: onlineConfigCache.source,
+        config: publicOnlineConfig(config)
+    });
+});
+app.use(["/presence", "/players", "/challenges"], attachOnlineConfig);
 // =========================================================
 // MyDragyPro online presence
 // =========================================================
@@ -873,6 +1117,10 @@ app.post(
     async (req, res) => {
         noStore(res);
         try {
+            const config = req.mdpOnlineConfig || await getOnlineConfig();
+            if (serviceUnavailable(config) || config.features.online_presence !== true) {
+                return onlineUnavailableResponse(res, config, "Online presence");
+            }
             const {
                 driver_name,
                 car_id,
@@ -887,6 +1135,16 @@ app.post(
             const acGuid = req.mdpIdentity.acGuid;
             const discordId = req.mdpIdentity.discordId;
             const updatedAt = nowUnixSeconds();
+            const appVersion = cleanText(app_version, 30);
+            if (config.client.minimum_online_version
+                && compareVersions(appVersion, config.client.minimum_online_version) < 0) {
+                return res.status(426).json({
+                    success: false,
+                    minimum_online_version: config.client.minimum_online_version,
+                    recommended_version: config.client.recommended_version,
+                    error: `MyDragyPro ${config.client.minimum_online_version} or newer is required for online services.`
+                });
+            }
             const record = {
                 player_id: acGuid,
                 discord_id: discordId,
@@ -901,7 +1159,7 @@ app.post(
                     cleanAvailability(availability),
                 challenge_access:
                     cleanChallengeAccess(challenge_access),
-                app_version: cleanText(app_version, 30),
+                app_version: appVersion,
                 updated_at: updatedAt,
                 version: 1
             };
@@ -911,7 +1169,7 @@ app.post(
                     presenceKeyForAcGuid(acGuid),
                     JSON.stringify(record),
                     "EX",
-                    PRESENCE_TTL_SECONDS
+                    config.network.presence_ttl_seconds
                 ],
                 [
                     "ZADD",
@@ -922,9 +1180,12 @@ app.post(
             ]);
             return res.status(200).json({
                 success: true,
-                expires_in: PRESENCE_TTL_SECONDS,
+                expires_in: config.network.presence_ttl_seconds,
                 next_heartbeat_in:
-                    PRESENCE_HEARTBEAT_SECONDS,
+                    config.network.presence_heartbeat_seconds,
+                recommended_version: config.client.recommended_version,
+                update_available: Boolean(config.client.recommended_version)
+                    && compareVersions(appVersion, config.client.recommended_version) < 0,
                 server_time: updatedAt
             });
         } catch (error) {
@@ -946,6 +1207,10 @@ app.get(
     requireLinkedIdentity,
     async (req, res) => {
         noStore(res);
+        const config = req.mdpOnlineConfig || await getOnlineConfig();
+        if (serviceUnavailable(config) || config.features.players !== true) {
+            return onlineUnavailableResponse(res, config, "Online players");
+        }
         const requesterGuid =
             req.mdpIdentity.acGuid;
         const poll = allowPlayerPoll(requesterGuid);
@@ -954,7 +1219,7 @@ app.get(
             return res.status(429).json({
                 success: false,
                 retry_after_seconds: poll.retryAfter,
-                error: "Player list refresh is limited to once every 40 seconds."
+                error: `Player list refresh is limited to once every ${config.limits.player_poll_min_seconds} seconds.`
             });
         }
         try {
@@ -964,7 +1229,7 @@ app.get(
                 cleanHash(requesterPresence?.server_hash);
             const now = nowUnixSeconds();
             const cutoff =
-                now - PRESENCE_STALE_SECONDS;
+                now - config.network.presence_ttl_seconds;
             // Cleanup and lookup are deliberately performed only when a user
             // asks for the roster. Heartbeats never poll the player list.
             const [, indexedIds] = await upstashPipeline([
@@ -981,7 +1246,7 @@ app.get(
                     cutoff,
                     "LIMIT",
                     0,
-                    MAX_VISIBLE_PLAYERS
+                    config.limits.max_visible_players
                 ]
             ]);
             const playerIds = Array.isArray(indexedIds)
@@ -1067,7 +1332,7 @@ app.get(
             return res.status(200).json({
                 success: true,
                 server_time: now,
-                ttl_seconds: PRESENCE_TTL_SECONDS,
+                ttl_seconds: config.network.presence_ttl_seconds,
                 count: players.length,
                 players
             });
@@ -1124,6 +1389,10 @@ app.post(
     async (req, res) => {
         noStore(res);
         try {
+            const config = req.mdpOnlineConfig || await getOnlineConfig();
+            if (serviceUnavailable(config) || config.features.challenges !== true) {
+                return onlineUnavailableResponse(res, config, "Online challenges");
+            }
             const fromPlayerId = req.mdpIdentity.acGuid;
             const toPlayerId = normalizeAcGuid(
                 req.body?.target_player_id
@@ -1147,6 +1416,12 @@ app.post(
                     success: false,
                     error: "Unsupported challenge type."
                 });
+            }
+            if (type === "beat_my_time" && config.features.beat_my_time !== true) {
+                return onlineUnavailableResponse(res, config, "Beat My Time");
+            }
+            if (type === "touge" && config.features.touge !== true) {
+                return onlineUnavailableResponse(res, config, "Touge Battles");
             }
             if (type === "touge") {
                 modeKey = "touge:basic";
@@ -1172,7 +1447,7 @@ app.post(
                 getPresenceRecord(toPlayerId)
             ]);
             if (!toPresence
-                || now - Number(toPresence.updated_at || 0) > PRESENCE_STALE_SECONDS) {
+                || now - Number(toPresence.updated_at || 0) > config.network.presence_ttl_seconds) {
                 return res.status(404).json({
                     success: false,
                     error: "That player is no longer online."
@@ -1223,9 +1498,13 @@ app.post(
                 await upstashCommand("DEL", pairKey);
             }
             const challengeId = crypto.randomBytes(16).toString("hex");
-            const expiresAt = now + CHALLENGE_TTL_SECONDS;
+            const challengeTtl = config.challenges.ttl_seconds;
+            const pendingTimeout = type === "touge"
+                ? config.challenges.touge.pending_timeout_seconds
+                : config.challenges.beat_my_time.pending_timeout_seconds;
+            const expiresAt = now + pendingTimeout;
             const tougeDifficulty = cleanTougeDifficulty(req.body?.difficulty);
-            const tougeRules = TOUGE_RULES[tougeDifficulty];
+            const tougeRules = config.touge_rules[tougeDifficulty];
             const challengerRole = cleanTougeRole(req.body?.challenger_role);
             const challenge = {
                 id: challengeId,
@@ -1242,7 +1521,7 @@ app.post(
                 difficulty: type === "touge" ? tougeDifficulty : "",
                 gap_limit_m: type === "touge" ? tougeRules.gap_limit_m : 0,
                 grace_seconds: type === "touge" ? tougeRules.grace_seconds : 0,
-                duration_seconds: type === "touge" ? 180 : 0,
+                duration_seconds: type === "touge" ? config.challenges.touge.duration_seconds : 0,
                 mode_key: modeKey,
                 mode_label: modeLabel,
                 target_ms: targetMs,
@@ -1275,13 +1554,13 @@ app.post(
                     challengeKey(challengeId),
                     JSON.stringify(challenge),
                     "EX",
-                    CHALLENGE_TTL_SECONDS
+                    challengeTtl
                 ],
                 ["ZADD", challengeInboxKey(toPlayerId), expiresAt, challengeId],
                 ["ZADD", challengeOutboxKey(fromPlayerId), expiresAt, challengeId],
-                ["EXPIRE", challengeInboxKey(toPlayerId), CHALLENGE_TTL_SECONDS],
-                ["EXPIRE", challengeOutboxKey(fromPlayerId), CHALLENGE_TTL_SECONDS],
-                ["SET", pairKey, challengeId, "EX", CHALLENGE_TTL_SECONDS]
+                ["EXPIRE", challengeInboxKey(toPlayerId), challengeTtl],
+                ["EXPIRE", challengeOutboxKey(fromPlayerId), challengeTtl],
+                ["SET", pairKey, challengeId, "EX", pendingTimeout]
             ]);
             resetChallengePollGuard(fromPlayerId);
             return res.status(201).json({
@@ -1307,9 +1586,19 @@ app.get(
     requireLinkedIdentity,
     async (req, res) => {
         noStore(res);
+        const config = req.mdpOnlineConfig || await getOnlineConfig();
+        if (serviceUnavailable(config) || config.features.challenges !== true) {
+            return onlineUnavailableResponse(res, config, "Online challenges");
+        }
         const playerId = req.mdpIdentity.acGuid;
         // Missing type preserves the phase-two contract for older Beat My Time clients.
         const requestedType = cleanChallengeType(req.query?.type) || "beat_my_time";
+        if (requestedType === "beat_my_time" && config.features.beat_my_time !== true) {
+            return onlineUnavailableResponse(res, config, "Beat My Time");
+        }
+        if (requestedType === "touge" && config.features.touge !== true) {
+            return onlineUnavailableResponse(res, config, "Touge Battles");
+        }
         const poll = allowChallengePoll(playerId, requestedType);
         if (!poll.allowed) {
             res.set("Retry-After", String(poll.retryAfter));
@@ -1329,11 +1618,11 @@ app.get(
                 ["ZREMRANGEBYSCORE", outboxKey, 0, now - 1],
                 [
                     "ZRANGEBYSCORE", inboxKey, now, "+inf",
-                    "LIMIT", 0, MAX_CHALLENGES_PER_LIST
+                    "LIMIT", 0, config.limits.max_challenges_per_list
                 ],
                 [
                     "ZRANGEBYSCORE", outboxKey, now, "+inf",
-                    "LIMIT", 0, MAX_CHALLENGES_PER_LIST
+                    "LIMIT", 0, config.limits.max_challenges_per_list
                 ]
             ]);
             const incoming = Array.isArray(incomingIds) ? incomingIds : [];
@@ -1369,7 +1658,7 @@ app.get(
             return res.status(200).json({
                 success: true,
                 server_time: now,
-                expires_in: CHALLENGE_TTL_SECONDS,
+                expires_in: config.challenges.ttl_seconds,
                 incoming: incomingChallenges,
                 outgoing: outgoingChallenges
             });
@@ -1394,6 +1683,7 @@ app.post(
     async (req, res) => {
         noStore(res);
         try {
+            const config = req.mdpOnlineConfig || await getOnlineConfig();
             const challenge = await getChallengeRecord(req.params.id);
             const playerId = req.mdpIdentity.acGuid;
             const action = cleanText(req.body?.action, 20).toLowerCase();
@@ -1413,6 +1703,9 @@ app.post(
             challenge.status = action === "accept" ? "accepted" : "declined";
             challenge.accepted_at = action === "accept" ? now : 0;
             challenge.terminal_at = action === "decline" ? now : 0;
+            if (action === "accept") {
+                challenge.expires_at = now + config.challenges.ttl_seconds;
+            }
             const ttl = challengeTtlRemaining(challenge, now);
             const commands = [[
                 "SET", challengeKey(challenge.id), JSON.stringify(challenge), "EX", ttl
@@ -1420,6 +1713,18 @@ app.post(
             if (action === "decline") {
                 commands.push(["DEL", challengePairKey(challenge.from_player_id, challenge.to_player_id)]);
                 commands.push(["DEL", tougeSyncKey(challenge.id)]);
+            } else {
+                commands.push(["ZADD", challengeInboxKey(challenge.to_player_id), challenge.expires_at, challenge.id]);
+                commands.push(["ZADD", challengeOutboxKey(challenge.from_player_id), challenge.expires_at, challenge.id]);
+                commands.push(["EXPIRE", challengeInboxKey(challenge.to_player_id), ttl]);
+                commands.push(["EXPIRE", challengeOutboxKey(challenge.from_player_id), ttl]);
+                commands.push([
+                    "SET",
+                    challengePairKey(challenge.from_player_id, challenge.to_player_id),
+                    challenge.id,
+                    "EX",
+                    ttl
+                ]);
             }
             await upstashPipeline(commands);
             resetChallengePollGuard(playerId);
@@ -1480,6 +1785,13 @@ app.post(
     async (req, res) => {
         noStore(res);
         try {
+            const config = req.mdpOnlineConfig || await getOnlineConfig();
+            if (serviceUnavailable(config)
+                || config.features.challenges !== true
+                || config.features.touge !== true
+                || config.features.touge_sync !== true) {
+                return onlineUnavailableResponse(res, config, "Touge synchronization");
+            }
             const challenge = await getChallengeRecord(req.params.id);
             const playerId = req.mdpIdentity.acGuid;
             const nowSeconds = nowUnixSeconds();
@@ -1509,8 +1821,8 @@ app.post(
                 actor,
                 ready ? 1 : 0,
                 nowMs,
-                TOUGE_READY_STALE_MS,
-                TOUGE_START_LEAD_MS,
+                config.challenges.touge.ready_stale_ms,
+                config.challenges.touge.start_lead_ms,
                 ttlMs
             );
             if (!Array.isArray(raw) || raw.length < 6) {
@@ -1530,7 +1842,7 @@ app.post(
                 both_ready: fromReady && toReady,
                 start_at_ms: startAtMs,
                 generation,
-                countdown_seconds: 3
+                countdown_seconds: Math.ceil(config.challenges.touge.start_lead_ms / 1000)
             });
         } catch (error) {
             console.error("[TOUGE] Synchronization failed:", error.response?.status || error.message);
@@ -1544,6 +1856,10 @@ app.post(
     async (req, res) => {
         noStore(res);
         try {
+            const config = req.mdpOnlineConfig || await getOnlineConfig();
+            if (serviceUnavailable(config) || config.features.challenges !== true) {
+                return onlineUnavailableResponse(res, config, "Online challenges");
+            }
             const challenge = await getChallengeRecord(req.params.id);
             const playerId = req.mdpIdentity.acGuid;
             const now = nowUnixSeconds();
@@ -1683,6 +1999,7 @@ app.post(
 app.get("/health", async (req, res) => {
     noStore(res);
     try {
+        const config = await getOnlineConfig();
         const redisReply = await upstashCommand("PING");
         const redisHealthy =
             String(redisReply || "").toUpperCase() === "PONG";
@@ -1692,11 +2009,14 @@ app.get("/health", async (req, res) => {
             render: "ok",
             upstash: redisHealthy ? "ok" : "unexpected_response",
             server_time: nowUnixSeconds(),
-            presence_ttl_seconds: PRESENCE_TTL_SECONDS,
-            heartbeat_seconds: PRESENCE_HEARTBEAT_SECONDS,
-            beat_my_time: "enabled",
-            touge_synchronized_start: "enabled",
-            challenge_ttl_seconds: CHALLENGE_TTL_SECONDS
+            presence_ttl_seconds: config.network.presence_ttl_seconds,
+            heartbeat_seconds: config.network.presence_heartbeat_seconds,
+            beat_my_time: config.features.beat_my_time ? "enabled" : "disabled",
+            touge_synchronized_start: config.features.touge_sync ? "enabled" : "disabled",
+            challenge_ttl_seconds: config.challenges.ttl_seconds,
+            maintenance: config.service.maintenance,
+            online_enabled: config.service.online_enabled,
+            config_source: onlineConfigCache.source
         });
     } catch (error) {
         console.error(
