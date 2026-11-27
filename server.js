@@ -46,8 +46,15 @@ const CHALLENGE_OUTBOX_PREFIX =
     "mydragypro:challenge-outbox:";
 const CHALLENGE_PAIR_PREFIX =
     "mydragypro:challenge-pair:";
+const TOUGE_SYNC_KEY_PREFIX =
+    "mydragypro:touge-sync:";
 const CHALLENGE_TTL_SECONDS = 2 * 60 * 60;
 const MAX_CHALLENGES_PER_LIST = 100;
+// Touge synchronization is deliberately separate from the 45-second challenge
+// list polling guard. Ready clients heartbeat this short-lived state while they
+// are staging, and Redis atomically creates or cancels one shared start time.
+const TOUGE_READY_STALE_MS = 2500;
+const TOUGE_START_LEAD_MS = 4000;
 // The official client polls every 45 seconds. Keep a small drift allowance while
 // preventing modified clients from repeatedly consuming Redis commands. This
 // process-local guard deliberately uses no Upstash operations.
@@ -268,6 +275,66 @@ function challengePairKey(firstPlayer, secondPlayer) {
         .digest("hex");
     return `${CHALLENGE_PAIR_PREFIX}${digest}`;
 }
+function tougeSyncKey(challengeId) {
+    return `${TOUGE_SYNC_KEY_PREFIX}${cleanText(challengeId, 64)}`;
+}
+
+// KEYS[1] is unique per challenge. The script updates one participant, expires
+// stale readiness, and creates/cancels start_at_ms as one atomic Redis action.
+// A start which has already reached GO is never revoked by a late packet.
+const TOUGE_SYNC_SCRIPT = String.raw`
+local key = KEYS[1]
+local actor = ARGV[1]
+local ready = tonumber(ARGV[2]) or 0
+local now = tonumber(ARGV[3]) or 0
+local stale = tonumber(ARGV[4]) or 2500
+local lead = tonumber(ARGV[5]) or 4000
+local ttl = tonumber(ARGV[6]) or 60000
+
+local start_at = tonumber(redis.call('HGET', key, 'start_at_ms')) or 0
+local generation = tonumber(redis.call('HGET', key, 'generation')) or 0
+local existing_from_ready = tonumber(redis.call('HGET', key, 'from_ready')) or 0
+local existing_to_ready = tonumber(redis.call('HGET', key, 'to_ready')) or 0
+local existing_from_seen = tonumber(redis.call('HGET', key, 'from_seen_ms')) or 0
+local existing_to_seen = tonumber(redis.call('HGET', key, 'to_seen_ms')) or 0
+
+if start_at > 0 and start_at <= now then
+  redis.call('PEXPIRE', key, ttl)
+  return { existing_from_ready, existing_to_ready, start_at, generation,
+      existing_from_seen, existing_to_seen }
+end
+
+redis.call('HSET', key, actor .. '_ready', ready, actor .. '_seen_ms', now)
+
+local from_ready = tonumber(redis.call('HGET', key, 'from_ready')) or 0
+local to_ready = tonumber(redis.call('HGET', key, 'to_ready')) or 0
+local from_seen = tonumber(redis.call('HGET', key, 'from_seen_ms')) or 0
+local to_seen = tonumber(redis.call('HGET', key, 'to_seen_ms')) or 0
+
+if from_seen <= 0 or now - from_seen > stale then
+  from_ready = 0
+  redis.call('HSET', key, 'from_ready', 0)
+end
+if to_seen <= 0 or now - to_seen > stale then
+  to_ready = 0
+  redis.call('HSET', key, 'to_ready', 0)
+end
+
+local both_ready = from_ready == 1 and to_ready == 1
+
+if start_at > now and not both_ready then
+  start_at = 0
+  generation = generation + 1
+  redis.call('HSET', key, 'start_at_ms', 0, 'generation', generation)
+elseif start_at <= 0 and both_ready then
+  start_at = now + lead
+  generation = generation + 1
+  redis.call('HSET', key, 'start_at_ms', start_at, 'generation', generation)
+end
+
+redis.call('PEXPIRE', key, ttl)
+return { from_ready, to_ready, start_at, generation, from_seen, to_seen }
+`;
 function challengeTtlRemaining(challenge, now = nowUnixSeconds()) {
     return Math.max(1, Number(challenge?.expires_at || 0) - now);
 }
@@ -510,7 +577,7 @@ app.get("/login", (req, res) => {
 });
 function renderAuthPage({ success, title, message }) {
     const accent = success ? "#55d68b" : "#ff5c70";
-    const icon = success ? "âœ“" : "!";
+    const icon = success ? "Ã¢Å“â€œ" : "!";
     const status = success ? "Discord Connected" : "Connection Failed";
     return `<!DOCTYPE html>
 <html lang="en">
@@ -1338,6 +1405,7 @@ app.post(
             ]];
             if (action === "decline") {
                 commands.push(["DEL", challengePairKey(challenge.from_player_id, challenge.to_player_id)]);
+                commands.push(["DEL", tougeSyncKey(challenge.id)]);
             }
             await upstashPipeline(commands);
             resetChallengePollGuard(playerId);
@@ -1377,7 +1445,8 @@ app.post(
                     "SET", challengeKey(challenge.id), JSON.stringify(challenge),
                     "EX", challengeTtlRemaining(challenge, now)
                 ],
-                ["DEL", challengePairKey(challenge.from_player_id, challenge.to_player_id)]
+                ["DEL", challengePairKey(challenge.from_player_id, challenge.to_player_id)],
+                ["DEL", tougeSyncKey(challenge.id)]
             ]);
             resetChallengePollGuard(playerId);
             return res.status(200).json({
@@ -1388,6 +1457,70 @@ app.post(
         } catch (error) {
             console.error("[CHALLENGE] Cancel failed:", error.response?.status || error.message);
             return res.status(503).json({ success: false, error: "The challenge could not be cancelled." });
+        }
+    }
+);
+app.post(
+    "/challenges/:id/touge-sync",
+    requireLinkedIdentity,
+    async (req, res) => {
+        noStore(res);
+        try {
+            const challenge = await getChallengeRecord(req.params.id);
+            const playerId = req.mdpIdentity.acGuid;
+            const nowSeconds = nowUnixSeconds();
+            const nowMs = Date.now();
+            if (!challenge || Number(challenge.expires_at || 0) <= nowSeconds) {
+                return res.status(404).json({ success: false, error: "Challenge expired or not found." });
+            }
+            if (cleanChallengeType(challenge.type) !== "touge") {
+                return res.status(400).json({ success: false, error: "Touge synchronization is only available for Touge challenges." });
+            }
+            if (challenge.status !== "accepted") {
+                return res.status(409).json({ success: false, error: "Touge challenge is not active." });
+            }
+            let actor = "";
+            if (challenge.from_player_id === playerId) actor = "from";
+            if (challenge.to_player_id === playerId) actor = "to";
+            if (!actor) {
+                return res.status(403).json({ success: false, error: "Only a Touge participant can synchronize this start." });
+            }
+            const ready = req.body?.ready === true;
+            const ttlMs = Math.max(1000, challengeTtlRemaining(challenge, nowSeconds) * 1000);
+            const raw = await upstashCommand(
+                "EVAL",
+                TOUGE_SYNC_SCRIPT,
+                1,
+                tougeSyncKey(challenge.id),
+                actor,
+                ready ? 1 : 0,
+                nowMs,
+                TOUGE_READY_STALE_MS,
+                TOUGE_START_LEAD_MS,
+                ttlMs
+            );
+            if (!Array.isArray(raw) || raw.length < 6) {
+                throw new Error("Touge synchronization returned an invalid response.");
+            }
+            const fromReady = Number(raw[0]) === 1;
+            const toReady = Number(raw[1]) === 1;
+            const startAtMs = Math.max(0, Number(raw[2]) || 0);
+            const generation = Math.max(0, Number(raw[3]) || 0);
+            const peerReady = actor === "from" ? toReady : fromReady;
+            const ownReady = actor === "from" ? fromReady : toReady;
+            return res.status(200).json({
+                success: true,
+                server_time_ms: nowMs,
+                ready: ownReady,
+                peer_ready: peerReady,
+                both_ready: fromReady && toReady,
+                start_at_ms: startAtMs,
+                generation,
+                countdown_seconds: 3
+            });
+        } catch (error) {
+            console.error("[TOUGE] Synchronization failed:", error.response?.status || error.message);
+            return res.status(503).json({ success: false, error: "Touge start synchronization is temporarily unavailable." });
         }
     }
 );
@@ -1465,7 +1598,8 @@ app.post(
                 const ttl = challengeTtlRemaining(challenge, now);
                 await upstashPipeline([
                     ["SET", challengeKey(challenge.id), JSON.stringify(challenge), "EX", ttl],
-                    ["DEL", challengePairKey(challenge.from_player_id, challenge.to_player_id)]
+                    ["DEL", challengePairKey(challenge.from_player_id, challenge.to_player_id)],
+                    ["DEL", tougeSyncKey(challenge.id)]
                 ]);
                 resetChallengePollGuard(challenge.from_player_id);
                 resetChallengePollGuard(challenge.to_player_id);
@@ -1547,6 +1681,7 @@ app.get("/health", async (req, res) => {
             presence_ttl_seconds: PRESENCE_TTL_SECONDS,
             heartbeat_seconds: PRESENCE_HEARTBEAT_SECONDS,
             beat_my_time: "enabled",
+            touge_synchronized_start: "enabled",
             challenge_ttl_seconds: CHALLENGE_TTL_SECONDS
         });
     } catch (error) {
@@ -1675,7 +1810,7 @@ app.post(
                 embeds: [
                     {
                         title:
-                            "ðŸ New Sponsored Track Request",
+                            "Ã°Å¸ÂÂ New Sponsored Track Request",
                         color: 5763719,
                         fields: [
                             {
